@@ -269,6 +269,14 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x70 => self.device_status,
+                    // Virtio 1.2 shared-memory region length registers
+                    // (VIRTIO_MMIO_SHM_LEN_LOW/HIGH). No Firecracker device
+                    // exposes shared memory regions, so report the selected
+                    // region's length as all-ones: the value the spec defines
+                    // for a nonexistent region. Guest drivers that enumerate
+                    // these during probe (e.g. virtio-fs looking for its DAX
+                    // cache window) treat any other length as a real region.
+                    0xb0 | 0xb4 => !0,
                     0xfc => self.config_generation,
                     _ => {
                         warn!("unknown virtio mmio register read: {:#x}", offset);
@@ -333,6 +341,12 @@ impl BusDevice for MmioTransport {
                     0x94 => self.update_queue_field(|q| hi(&mut q.avail_ring_address, v)),
                     0xa0 => self.update_queue_field(|q| lo(&mut q.used_ring_address, v)),
                     0xa4 => self.update_queue_field(|q| hi(&mut q.used_ring_address, v)),
+                    // Virtio 1.2 shared-memory region selector
+                    // (VIRTIO_MMIO_SHM_SEL). Firecracker devices expose no
+                    // shared memory regions, so the selection is irrelevant;
+                    // accept and ignore the write. Reads of the region length
+                    // registers above report every region as nonexistent.
+                    0xac => {}
                     _ => {
                         warn!("unknown virtio mmio register write: {:#x}", offset);
                     }
