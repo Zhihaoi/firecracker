@@ -480,21 +480,14 @@ pub fn restore_from_snapshot(
                 None,
             )
         }
-        MemBackendType::Uffd => {
-            if has_fs_devices {
-                return Err(RestoreFromSnapshotGuestMemoryError::Uffd(
-                    GuestMemoryFromUffdError::VhostUserFs,
-                )
-                .into());
-            }
-            guest_memory_from_uffd(
-                mem_backend_path,
-                mem_state,
-                track_dirty_pages,
-                vm_resources.machine_config.huge_pages,
-            )
-            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
-        }
+        MemBackendType::Uffd => guest_memory_from_uffd(
+            mem_backend_path,
+            mem_state,
+            track_dirty_pages,
+            vm_resources.machine_config.huge_pages,
+            has_fs_devices,
+        )
+        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -583,9 +576,6 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
-    /// Cannot restore vhost-user fs devices with a uffd memory backend (the
-    /// backend must share fd-backed guest memory); use the File backend
-    VhostUserFs,
 }
 
 fn guest_memory_from_uffd(
@@ -593,9 +583,10 @@ fn guest_memory_from_uffd(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    has_fs_devices: bool,
 ) -> Result<(Vec<GuestRegionMmap>, Option<Uffd>), GuestMemoryFromUffdError> {
     let (guest_memory, backend_mappings) =
-        create_guest_memory(mem_state, track_dirty_pages, huge_pages)?;
+        create_guest_memory(mem_state, track_dirty_pages, huge_pages, has_fs_devices)?;
 
     let mut uffd_builder = UffdBuilder::new();
 
@@ -626,8 +617,22 @@ fn create_guest_memory(
     mem_state: &GuestMemoryState,
     track_dirty_pages: bool,
     huge_pages: HugePageConfig,
+    has_fs_devices: bool,
 ) -> Result<(Vec<GuestRegionMmap>, Vec<GuestRegionUffdMapping>), GuestMemoryFromUffdError> {
-    let guest_memory = memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?;
+    // vhost-user fs backends mmap guest memory through the vhost-user mem
+    // table, which requires fd-backed, MAP_SHARED regions (the same shape
+    // fresh boot picks in `VmResources::allocate_memory_regions`), so restore
+    // onto a memfd when the snapshot carries fs devices and keep stock
+    // anonymous memory otherwise. The uffd registration and handshake done by
+    // the caller are shape-agnostic: uffd missing mode works on shmem VMAs,
+    // `base_host_virt_addr` comes from the region mappings either way, and
+    // region offsets are cumulative in both memory shapes.
+    let guest_memory = if has_fs_devices {
+        let regions: Vec<_> = mem_state.regions().collect();
+        memory::memfd_backed(&regions, track_dirty_pages, huge_pages)?
+    } else {
+        memory::anonymous(mem_state.regions(), track_dirty_pages, huge_pages)?
+    };
     let mut backend_mappings = Vec::with_capacity(guest_memory.len());
     let mut offset = 0;
     for mem_region in guest_memory.iter() {
@@ -837,13 +842,66 @@ mod tests {
             }],
         };
 
-        let (_, uffd_regions) =
-            create_guest_memory(&mem_state, false, HugePageConfig::None).unwrap();
+        let (guest_memory, uffd_regions) =
+            create_guest_memory(&mem_state, false, HugePageConfig::None, false).unwrap();
 
+        // Without fs devices the uffd restore path keeps stock anonymous memory.
+        assert_eq!(guest_memory.len(), 1);
+        assert!(guest_memory[0].file_offset().is_none());
         assert_eq!(uffd_regions.len(), 1);
         assert_eq!(uffd_regions[0].size, 0x20000);
         assert_eq!(uffd_regions[0].offset, 0);
         assert_eq!(uffd_regions[0].page_size, HugePageConfig::None.page_size());
+    }
+
+    #[test]
+    fn test_create_guest_memory_with_fs_devices() {
+        let mem_state = GuestMemoryState {
+            regions: vec![
+                GuestMemoryRegionState {
+                    base_address: 0,
+                    size: 0x20000,
+                    region_type: GuestRegionType::Dram,
+                    plugged: vec![true],
+                },
+                GuestMemoryRegionState {
+                    base_address: 0x20000,
+                    size: 0x10000,
+                    region_type: GuestRegionType::Dram,
+                    plugged: vec![true],
+                },
+            ],
+        };
+
+        // With fs devices the uffd restore path backs guest memory with a
+        // memfd, so regions carry an fd the vhost-user mem table can share.
+        let (guest_memory_shared, uffd_regions_shared) =
+            create_guest_memory(&mem_state, false, HugePageConfig::None, true).unwrap();
+        assert_eq!(guest_memory_shared.len(), 2);
+        assert!(
+            guest_memory_shared
+                .iter()
+                .all(|region| region.file_offset().is_some())
+        );
+
+        // The region descriptors handed to the uffd handler have the same
+        // sizes, cumulative offsets and page size in both memory shapes (only
+        // `base_host_virt_addr` differs, as it names the actual mappings).
+        let (guest_memory_anon, uffd_regions_anon) =
+            create_guest_memory(&mem_state, false, HugePageConfig::None, false).unwrap();
+        assert!(
+            guest_memory_anon
+                .iter()
+                .all(|region| region.file_offset().is_none())
+        );
+        assert_eq!(uffd_regions_anon.len(), uffd_regions_shared.len());
+        for (anon, shared) in uffd_regions_anon.iter().zip(uffd_regions_shared.iter()) {
+            assert_eq!(anon.size, shared.size);
+            assert_eq!(anon.offset, shared.offset);
+            assert_eq!(anon.page_size, shared.page_size);
+        }
+        assert_eq!(uffd_regions_shared[0].offset, 0);
+        assert_eq!(uffd_regions_shared[1].offset, 0x20000);
     }
 
     #[test]
