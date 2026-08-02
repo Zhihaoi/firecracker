@@ -22,6 +22,8 @@ use crate::devices::virtio::balloon::persist::{BalloonConstructorArgs, BalloonSt
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::block::persist::{BlockConstructorArgs, BlockState};
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::fs::device::VhostUserFs;
+use crate::devices::virtio::fs::persist::{FsConstructorArgs, VhostUserFsState};
 use crate::devices::virtio::mem::VirtioMem;
 use crate::devices::virtio::mem::persist::{VirtioMemConstructorArgs, VirtioMemState};
 use crate::devices::virtio::net::Net;
@@ -127,6 +129,8 @@ pub struct DeviceStates {
     pub entropy_device: Option<VirtioDeviceState<EntropyState>>,
     /// Pmem device states.
     pub pmem_devices: Vec<VirtioDeviceState<PmemState>>,
+    /// Fs device states.
+    pub fs_devices: Vec<VirtioDeviceState<VhostUserFsState>>,
     /// Memory device state.
     pub memory_device: Option<VirtioDeviceState<VirtioMemState>>,
 }
@@ -377,6 +381,23 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
                         device_info,
                     })
                 }
+                // The backend device-state blob was already captured by
+                // `Vmm::save_state` via
+                // `DeviceManager::capture_fs_backend_states`, so the
+                // infallible save below only packages it.
+                VirtioDeviceType::Fs => {
+                    let fs = locked_device
+                        .as_mut_any()
+                        .downcast_mut::<VhostUserFs>()
+                        .unwrap();
+                    let device_state = fs.save();
+                    states.fs_devices.push(VirtioDeviceState {
+                        device_id,
+                        device_state,
+                        transport_state,
+                        device_info,
+                    });
+                }
                 VirtioDeviceType::Mem => {
                     let mem = locked_device
                         .as_mut_any()
@@ -613,10 +634,33 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
             )?;
         }
 
+        for fs_state in &state.fs_devices {
+            let device = Arc::new(Mutex::new(VhostUserFs::restore(
+                FsConstructorArgs { mem: mem.clone() },
+                &fs_state.device_state,
+            )?));
+
+            constructor_args
+                .vm_resources
+                .fs
+                .devices
+                .push(device.clone());
+
+            restore_helper(
+                device,
+                fs_state.device_state.virtio_state.activated,
+                // Fs devices are vhost-user devices.
+                true,
+                &fs_state.device_id,
+                &fs_state.transport_state,
+                &fs_state.device_info,
+                constructor_args.event_manager,
+            )?;
+        }
+
         if let Some(memory_state) = &state.memory_device {
             let ctor_args = VirtioMemConstructorArgs::new(Arc::clone(vm));
             let device = VirtioMem::restore(ctor_args, &memory_state.device_state)?;
-
             constructor_args.vm_resources.memory_hotplug = Some(MemoryHotplugConfig {
                 total_size_mib: device.total_size_mib(),
                 block_size_mib: device.block_size_mib(),

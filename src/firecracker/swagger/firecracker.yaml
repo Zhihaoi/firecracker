@@ -339,6 +339,40 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /fs/{fs_id}:
+    put:
+      summary: Creates or updates a vhost-user-fs device. Pre-boot only.
+      description:
+        Creates new vhost-user-fs device with ID specified by fs_id path parameter.
+        If a device with the specified ID already exists, updates its state based on new input.
+        Will fail if update is not possible.
+        The vhost-user backend socket is connected when this call is handled,
+        so an unreachable backend fails the call.
+      operationId: putGuestFsByID
+      parameters:
+        - name: fs_id
+          in: path
+          description: The id of the guest fs device
+          required: true
+          type: string
+        - name: body
+          in: body
+          description: Guest fs device properties
+          required: true
+          schema:
+            $ref: "#/definitions/Fs"
+      responses:
+        204:
+          description: Fs device created/updated
+        400:
+          description: Fs device cannot be created/updated due to bad input
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error.
+          schema:
+            $ref: "#/definitions/Error"
+
   /pmem/{id}:
     put:
       summary: Creates or updates a pmem device. Pre-boot only.
@@ -1261,6 +1295,29 @@ definitions:
           Path to the socket of vhost-user-block backend.
           This field is required for vhost-user-block config should be omitted for virtio-block configuration.
 
+  Fs:
+    type: object
+    required:
+      - fs_id
+      - socket
+    properties:
+      fs_id:
+        type: string
+        description:
+          Unique identifier of the vhost-user-fs device.
+      socket:
+        type: string
+        description:
+          Path to the socket of the vhost-user-fs backend.
+      tag:
+        type: string
+        description:
+          Mount tag presented to the guest. Defaults to fs_id.
+      num_request_queues:
+        type: integer
+        description:
+          Number of request queues, in addition to the hiprio queue. Defaults to 1.
+
   Pmem:
     type: object
     required:
@@ -1305,6 +1362,11 @@ definitions:
         description: Configurations for all block devices.
         items:
           $ref: "#/definitions/Drive"
+      fs:
+        type: array
+        description: Configurations for all vhost-user-fs devices.
+        items:
+          $ref: "#/definitions/Fs"
       boot-source:
         $ref: "#/definitions/BootSource"
       cpu-config:

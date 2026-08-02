@@ -15,6 +15,7 @@ use crate::devices::virtio::net::TapError;
 pub mod balloon;
 pub mod block;
 pub mod device;
+pub mod fs;
 pub mod generated;
 mod iov_deque;
 pub mod iovec;
@@ -61,6 +62,8 @@ pub enum ActivateError {
     EventFd,
     /// Vhost user: {0}
     VhostUser(vhost_user::VhostUserError),
+    /// Vhost user fs: {0}
+    VhostUserFs(fs::VhostUserFsError),
     /// Setting tap interface offload flags failed: {0}
     TapSetOffload(TapError),
     /// Error setting pointers in the queue: (0)

@@ -60,6 +60,8 @@ pub enum MemoryError {
     OffsetTooLarge,
     /// Cannot retrieve snapshot file metadata: {0}
     FileMetadata(std::io::Error),
+    /// Cannot copy snapshot file contents into a memfd: {0}
+    MemfdCopy(std::io::Error),
     /// Memory region has zero size
     ZeroSize,
     /// Memory region has zero slots
@@ -922,6 +924,43 @@ pub fn snapshot_file(
         regions.into_iter(),
         libc::MAP_PRIVATE,
         Some(file),
+        track_dirty_pages,
+        huge_pages.madvise_flags(),
+    )
+}
+
+/// Creates a `Vec` of `GuestRegionMmap` given a `file` containing the data
+/// and a `state` containing mapping information, backed by a private memfd
+/// copy of the file mapped MAP_SHARED.
+///
+/// vhost-user devices share guest memory with their backend through the
+/// mem table fds, so the guest-side mapping must be MAP_SHARED on the same
+/// inode the backend mmaps (a MAP_PRIVATE mapping would silently diverge
+/// on the first guest write). The copy into a fresh memfd keeps the
+/// snapshot memory file pristine across restores.
+pub fn snapshot_file_shared(
+    mut file: File,
+    regions: impl Iterator<Item = (GuestAddress, usize)>,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, MemoryError> {
+    let regions: Vec<_> = regions.collect();
+    let memory_size = regions
+        .iter()
+        .try_fold(0u64, |acc, (_, size)| acc.checked_add(*size as u64))
+        .ok_or(MemoryError::OffsetTooLarge)?;
+    let file_size = file.metadata().map_err(MemoryError::FileMetadata)?.len();
+    if memory_size > file_size {
+        return Err(MemoryError::OffsetTooLarge);
+    }
+
+    let mut memfd_file = create_memfd(memory_size, huge_pages.into())?.into_file();
+    std::io::copy(&mut file, &mut memfd_file).map_err(MemoryError::MemfdCopy)?;
+
+    create(
+        regions.into_iter(),
+        libc::MAP_SHARED | huge_pages.mmap_flags(),
+        Some(memfd_file),
         track_dirty_pages,
         huge_pages.madvise_flags(),
     )

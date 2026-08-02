@@ -40,6 +40,8 @@ use crate::devices::virtio::balloon::BalloonError;
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
+use crate::devices::virtio::fs::VhostUserFsError;
+use crate::devices::virtio::fs::device::VhostUserFs;
 use crate::devices::virtio::mem::persist::VirtioMemPersistError;
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::net::persist::NetPersistError;
@@ -452,6 +454,24 @@ impl DeviceManager {
         }
     }
 
+    /// Capture the backend state of every vhost-user-fs device in
+    /// preparation for a snapshot. This talks to the vhost-user backends
+    /// (a DEVICE_STATE transfer), so it can fail; it must be called with
+    /// the VM paused, before the infallible device save embeds the
+    /// captured blobs in the device states.
+    pub fn capture_fs_backend_states(&self) -> Result<(), VhostUserFsError> {
+        let mut result = Ok(());
+        self.for_each_virtio_device_mut(|device_type, device| {
+            if result.is_ok()
+                && let VirtioDeviceType::Fs = device_type
+                && let Some(fs) = device.as_mut_any().downcast_mut::<VhostUserFs>()
+            {
+                result = fs.capture_backend_state();
+            }
+        });
+        result
+    }
+
     /// Attaches a device after VM start
     pub fn hotplug_device(
         &mut self,
@@ -641,6 +661,8 @@ pub enum DevicePersistError {
     MmdsConfig(#[from] MmdsConfigError),
     /// Entropy: {0}
     Entropy(#[from] EntropyPersistError),
+    /// Fs: {0}
+    Fs(#[from] VhostUserFsError),
     /// Pmem: {0}
     Pmem(#[from] PmemPersistError),
     /// virtio-mem: {0}

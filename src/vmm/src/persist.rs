@@ -134,6 +134,8 @@ pub enum MicrovmStateError {
     NotAllowed(String),
     /// Cannot restore devices: {0}
     RestoreDevices(#[from] DevicePersistError),
+    /// Cannot capture fs device backend state: {0}
+    SaveFsBackendState(crate::devices::virtio::fs::VhostUserFsError),
     /// Cannot save Vcpu state: {0}
     SaveVcpuState(vstate::vcpu::VcpuError),
     /// Cannot save KvmVm state: {0}
@@ -163,7 +165,7 @@ pub enum CreateSnapshotError {
 }
 
 /// Snapshot version
-pub const SNAPSHOT_VERSION: Version = Version::new(11, 0, 0);
+pub const SNAPSHOT_VERSION: Version = Version::new(12, 0, 0);
 
 /// Creates a Microvm snapshot.
 pub fn create_snapshot(
@@ -414,6 +416,15 @@ pub fn restore_from_snapshot(
 
     let track_dirty_pages = params.track_dirty_pages;
 
+    // vhost-user fs devices share guest memory with their backend through
+    // the vhost-user mem table, so a snapshot carrying fs devices must be
+    // restored onto fd-backed, MAP_SHARED memory.
+    let has_fs_devices = match &microvm_state.device_states.virtio_state {
+        VirtioDevicesState::Mmio(mmio_state) => !mmio_state.fs_devices.is_empty(),
+        // fs devices are not supported over PCI and never saved there.
+        VirtioDevicesState::Pci(_) => false,
+    };
+
     let vcpu_count = microvm_state
         .vcpu_states
         .len()
@@ -449,23 +460,41 @@ pub fn restore_from_snapshot(
                 .into());
             }
             (
-                guest_memory_from_file(
-                    mem_backend_path,
-                    mem_state,
-                    track_dirty_pages,
-                    vm_resources.machine_config.huge_pages,
-                )
-                .map_err(RestoreFromSnapshotGuestMemoryError::File)?,
+                if has_fs_devices {
+                    guest_memory_from_file_shared(
+                        mem_backend_path,
+                        mem_state,
+                        track_dirty_pages,
+                        vm_resources.machine_config.huge_pages,
+                    )
+                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?
+                } else {
+                    guest_memory_from_file(
+                        mem_backend_path,
+                        mem_state,
+                        track_dirty_pages,
+                        vm_resources.machine_config.huge_pages,
+                    )
+                    .map_err(RestoreFromSnapshotGuestMemoryError::File)?
+                },
                 None,
             )
         }
-        MemBackendType::Uffd => guest_memory_from_uffd(
-            mem_backend_path,
-            mem_state,
-            track_dirty_pages,
-            vm_resources.machine_config.huge_pages,
-        )
-        .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?,
+        MemBackendType::Uffd => {
+            if has_fs_devices {
+                return Err(RestoreFromSnapshotGuestMemoryError::Uffd(
+                    GuestMemoryFromUffdError::VhostUserFs,
+                )
+                .into());
+            }
+            guest_memory_from_uffd(
+                mem_backend_path,
+                mem_state,
+                track_dirty_pages,
+                vm_resources.machine_config.huge_pages,
+            )
+            .map_err(RestoreFromSnapshotGuestMemoryError::Uffd)?
+        }
     };
     builder::build_microvm_from_snapshot(
         instance_info,
@@ -525,6 +554,22 @@ fn guest_memory_from_file(
     Ok(guest_mem)
 }
 
+/// Same as [`guest_memory_from_file`], but the memory ends up MAP_SHARED on
+/// a private memfd copy of the snapshot file, so vhost-user fs backends can
+/// share it. The copy keeps the snapshot memory file pristine across
+/// restores.
+fn guest_memory_from_file_shared(
+    mem_file_path: &Path,
+    mem_state: &GuestMemoryState,
+    track_dirty_pages: bool,
+    huge_pages: HugePageConfig,
+) -> Result<Vec<GuestRegionMmap>, GuestMemoryFromFileError> {
+    let mem_file = File::open(mem_file_path)?;
+    let guest_mem =
+        memory::snapshot_file_shared(mem_file, mem_state.regions(), track_dirty_pages, huge_pages)?;
+    Ok(guest_mem)
+}
+
 /// Error type for [`guest_memory_from_uffd`]
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum GuestMemoryFromUffdError {
@@ -538,6 +583,9 @@ pub enum GuestMemoryFromUffdError {
     Connect(#[from] std::io::Error),
     /// Failed to sends file descriptor: {0}
     Send(#[from] vmm_sys_util::errno::Error),
+    /// Cannot restore vhost-user fs devices with a uffd memory backend (the
+    /// backend must share fd-backed guest memory); use the File backend
+    VhostUserFs,
 }
 
 fn guest_memory_from_uffd(

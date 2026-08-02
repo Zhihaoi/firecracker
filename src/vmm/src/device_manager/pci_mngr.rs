@@ -465,6 +465,12 @@ impl<'a> Persist<'a> for PciDevices {
                         transport_state,
                     });
                 }
+                VirtioDeviceType::Fs => {
+                    warn!(
+                        "Skipping vhost-user-fs device. VhostUserFs does not support \
+                         snapshotting yet"
+                    );
+                }
                 VirtioDeviceType::Mem => {
                     let mem_dev = locked_virtio_dev
                         .as_mut_any()

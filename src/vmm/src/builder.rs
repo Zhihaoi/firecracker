@@ -31,6 +31,7 @@ use crate::device_manager::{
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::fs::device::VhostUserFs;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB, VirtioMem};
 use crate::devices::virtio::net::Net;
 use crate::devices::virtio::pmem::device::Pmem;
@@ -237,6 +238,13 @@ pub fn build_microvm_for_boot(
         &vm,
         &mut boot_cmdline,
         vm_resources.block.devices.iter(),
+        event_manager,
+    )?;
+    attach_fs_devices(
+        &mut device_manager,
+        &vm,
+        &mut boot_cmdline,
+        vm_resources.fs.devices.iter(),
         event_manager,
     )?;
     attach_net_devices(
@@ -680,6 +688,29 @@ fn attach_block_devices<'a, I: Iterator<Item = &'a Arc<Mutex<Block>>> + Debug>(
             cmdline,
             event_manager,
             is_vhost_user,
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_fs_devices<'a, I: Iterator<Item = &'a Arc<Mutex<VhostUserFs>>> + Debug>(
+    device_manager: &mut DeviceManager,
+    vm: &Vm,
+    cmdline: &mut LoaderKernelCmdline,
+    fs_devices: I,
+    event_manager: &mut EventManager,
+) -> Result<(), StartMicrovmError> {
+    for fs in fs_devices {
+        let id = fs.lock().expect("Poisoned lock").id().to_string();
+        // The device mutex mustn't be locked here otherwise it will deadlock.
+        device_manager.attach_boot_virtio_device(
+            vm,
+            id,
+            fs.clone(),
+            cmdline,
+            event_manager,
+            // Fs devices are vhost-user devices.
+            true,
         )?;
     }
     Ok(())

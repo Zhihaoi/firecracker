@@ -138,6 +138,7 @@ use crate::devices::virtio::balloon::{
 use crate::devices::virtio::block::BlockError;
 use crate::devices::virtio::block::device::Block;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceId, VirtioDeviceType};
+use crate::devices::virtio::fs::device::VhostUserFs;
 use crate::devices::virtio::mem::device::VirtioMem;
 use crate::devices::virtio::mem::{VIRTIO_MEM_DEV_ID, VirtioMemError, VirtioMemStatus};
 use crate::devices::virtio::net::Net;
@@ -348,6 +349,7 @@ impl Vmm {
         let mut net = Vec::new();
         let mut net_with_mmds = Vec::new();
         let mut pmem = Vec::new();
+        let mut fs = Vec::new();
         let mut balloon = None;
         let mut vsock = None;
         let mut entropy = None;
@@ -377,6 +379,11 @@ impl Vmm {
                 VirtioDeviceType::Pmem => {
                     if let Some(p) = device.as_any().downcast_ref::<Pmem>() {
                         pmem.push(p.config.clone());
+                    }
+                }
+                VirtioDeviceType::Fs => {
+                    if let Some(f) = device.as_any().downcast_ref::<VhostUserFs>() {
+                        fs.push(f.config());
                     }
                 }
                 VirtioDeviceType::Balloon => {
@@ -427,6 +434,7 @@ impl Vmm {
             vsock,
             entropy,
             pmem_devices: pmem,
+            fs_devices: fs,
             // serial_config is marked serde(skip) so that it doesnt end up in snapshots
             serial_config: None,
             memory_hotplug,
@@ -443,6 +451,15 @@ impl Vmm {
                     && b.is_vhost_user()
                 {
                     tuples.push(("vhost-user-block", b.id().to_owned()));
+                }
+                // vhost-user-fs devices are snapshottable as long as the
+                // backend negotiated the DEVICE_STATE protocol feature;
+                // otherwise its state cannot be transferred.
+                if let VirtioDeviceType::Fs = device_type
+                    && let Some(f) = device.as_any().downcast_ref::<VhostUserFs>()
+                    && !f.snapshot_capable()
+                {
+                    tuples.push(("vhost-user-fs", f.id().to_owned()));
                 }
             });
         if tuples.is_empty() {
@@ -499,6 +516,14 @@ impl Vmm {
     /// Saves the state of a paused Microvm.
     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
         self.check_unsnapshottable_devices()?;
+
+        // vhost-user fs devices embed their backend's state in the
+        // snapshot. Capturing it is a vhost-user round trip with the
+        // backend and can fail, so it runs here, before the infallible
+        // device save below packages the captured blobs.
+        self.device_manager
+            .capture_fs_backend_states()
+            .map_err(MicrovmStateError::SaveFsBackendState)?;
 
         // We need to save device state before saving KVM state.
         // Some devices, (at the time of writing this comment block device with async engine)

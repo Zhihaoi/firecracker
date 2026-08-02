@@ -4,7 +4,8 @@
 // Portions Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::fd::AsRawFd;
+use std::fs::File;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
@@ -51,6 +52,10 @@ pub enum VhostUserError {
     VhostUserSetVringKick(VhostError),
     /// Set vring enable failed: {0}
     VhostUserSetVringEnable(VhostError),
+    /// Set device state fd failed: {0}
+    VhostUserSetDeviceStateFd(VhostError),
+    /// Check device state failed: {0}
+    VhostUserCheckDeviceState(VhostError),
     /// Failed to read vhost eventfd: No memory region found
     VhostUserNoMemoryRegion,
     /// Invalid used address
@@ -160,6 +165,24 @@ pub trait VhostUserHandleBackend: Sized {
     ) -> Result<(), vhost::Error> {
         unimplemented!()
     }
+
+    /// Begin transfer of internal state from/to the backend for the purpose
+    /// of migration/snapshotting. Requires the DEVICE_STATE protocol feature
+    /// to be negotiated.
+    fn set_device_state_fd(
+        &self,
+        _direction: VhostTransferStateDirection,
+        _phase: VhostTransferStatePhase,
+        _fd: OwnedFd,
+    ) -> Result<Option<File>, vhost::Error> {
+        unimplemented!()
+    }
+
+    /// Inquire the backend to report any errors that occurred during the
+    /// state transfer started with `set_device_state_fd`.
+    fn check_device_state(&self) -> Result<(), vhost::Error> {
+        unimplemented!()
+    }
 }
 
 impl VhostUserHandleBackend for Frontend {
@@ -259,6 +282,19 @@ impl VhostUserHandleBackend for Frontend {
         buf: &[u8],
     ) -> Result<(), vhost::Error> {
         <Frontend as VhostUserFrontend>::set_config(self, offset, flags, buf)
+    }
+
+    fn set_device_state_fd(
+        &self,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+        fd: OwnedFd,
+    ) -> Result<Option<File>, vhost::Error> {
+        <Frontend as VhostUserFrontend>::set_device_state_fd(self, direction, phase, fd)
+    }
+
+    fn check_device_state(&self) -> Result<(), vhost::Error> {
+        <Frontend as VhostUserFrontend>::check_device_state(self)
     }
 }
 
@@ -361,6 +397,28 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
         }
 
         Ok((acked_features, acked_protocol_features.bits()))
+    }
+
+    /// Begin a device state transfer with the backend (snapshot save/load).
+    /// The fd carries the state: the backend writes its state blob into it
+    /// for `SAVE` and reads the state blob from it for `LOAD`.
+    pub fn set_device_state_fd(
+        &self,
+        direction: VhostTransferStateDirection,
+        phase: VhostTransferStatePhase,
+        fd: OwnedFd,
+    ) -> Result<Option<File>, VhostUserError> {
+        self.vu
+            .set_device_state_fd(direction, phase, fd)
+            .map_err(VhostUserError::VhostUserSetDeviceStateFd)
+    }
+
+    /// Check that the device state transfer started with
+    /// `set_device_state_fd` completed without backend errors.
+    pub fn check_device_state(&self) -> Result<(), VhostUserError> {
+        self.vu
+            .check_device_state()
+            .map_err(VhostUserError::VhostUserCheckDeviceState)
     }
 
     /// Update guest memory table to the backend.
@@ -984,5 +1042,91 @@ pub(crate) mod tests {
         assert_eq!(result[0].call, expected_config.call);
         assert_eq!(result[0].kick, expected_config.kick);
         assert_eq!(result[0].enable, expected_config.enable);
+    }
+
+    #[test]
+    fn test_device_state_transfer() {
+        struct MockFrontend {
+            direction: std::cell::UnsafeCell<Option<VhostTransferStateDirection>>,
+            phase: std::cell::UnsafeCell<Option<VhostTransferStatePhase>>,
+            fd: std::cell::UnsafeCell<Option<OwnedFd>>,
+            fail_check: bool,
+        }
+
+        impl VhostUserHandleBackend for MockFrontend {
+            fn set_device_state_fd(
+                &self,
+                direction: VhostTransferStateDirection,
+                phase: VhostTransferStatePhase,
+                fd: OwnedFd,
+            ) -> Result<Option<File>, vhost::Error> {
+                unsafe {
+                    *self.direction.get() = Some(direction);
+                    *self.phase.get() = Some(phase);
+                    *self.fd.get() = Some(fd);
+                }
+                Ok(None)
+            }
+
+            fn check_device_state(&self) -> Result<(), vhost::Error> {
+                if self.fail_check {
+                    Err(vhost::Error::InvalidOperation)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let vuh = VhostUserHandleImpl {
+            vu: MockFrontend {
+                direction: std::cell::UnsafeCell::new(None),
+                phase: std::cell::UnsafeCell::new(None),
+                fd: std::cell::UnsafeCell::new(None),
+                fail_check: false,
+            },
+            socket_path: "".to_string(),
+        };
+
+        // set_device_state_fd passes direction, phase and fd through to the
+        // backend and check_device_state reports backend success.
+        let file = TempFile::new().unwrap().into_file();
+        let expected_fd = file.as_raw_fd();
+        assert!(
+            vuh.set_device_state_fd(
+                VhostTransferStateDirection::SAVE,
+                VhostTransferStatePhase::STOPPED,
+                file.into(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            unsafe { *vuh.vu.direction.get() },
+            Some(VhostTransferStateDirection::SAVE)
+        );
+        assert_eq!(
+            unsafe { *vuh.vu.phase.get() },
+            Some(VhostTransferStatePhase::STOPPED)
+        );
+        assert_eq!(
+            unsafe { (*vuh.vu.fd.get()).as_ref().unwrap().as_raw_fd() },
+            expected_fd
+        );
+        vuh.check_device_state().unwrap();
+
+        // A backend transfer failure surfaces as a check_device_state error.
+        let vuh = VhostUserHandleImpl {
+            vu: MockFrontend {
+                direction: std::cell::UnsafeCell::new(None),
+                phase: std::cell::UnsafeCell::new(None),
+                fd: std::cell::UnsafeCell::new(None),
+                fail_check: true,
+            },
+            socket_path: "".to_string(),
+        };
+        assert!(matches!(
+            vuh.check_device_state(),
+            Err(VhostUserError::VhostUserCheckDeviceState(_))
+        ));
     }
 }
