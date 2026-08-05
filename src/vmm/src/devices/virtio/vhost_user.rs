@@ -359,6 +359,19 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
         Ok(())
     }
 
+    // === AGENTVFS LOCAL CHANGE BEGIN: reply-bearing round trip for the fs
+    // device's vring-enable fence (Gate 12) ===
+    /// Re-query the backend's protocol features: a pure round trip on the
+    /// ordered socket. The fs device's activate() uses it to prove the
+    /// backend processed the fire-and-forget SET_VRING_ENABLE messages
+    /// before any kick can be consumed-and-dropped (see the fence there).
+    pub fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures, VhostUserError> {
+        self.vu
+            .get_protocol_features()
+            .map_err(VhostUserError::VhostUserGetProtocolFeatures)
+    }
+    // === AGENTVFS LOCAL CHANGE END ===
+
     /// Negotiate virtio and protocol features with the backend.
     pub fn negotiate_features(
         &mut self,

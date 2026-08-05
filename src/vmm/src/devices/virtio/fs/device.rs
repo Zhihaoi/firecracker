@@ -424,6 +424,29 @@ where
                 self.metrics.activate_fails.inc();
                 ActivateError::VhostUser(err)
             })?;
+        // === AGENTVFS LOCAL CHANGE BEGIN: fence the vring-enable before any kick (Gate 12) ===
+        // The vhost crate's wait_for_ack is a no-op unless the backend
+        // negotiated REPLY_ACK, and our backend doesn't — so
+        // SET_VRING_ENABLE is fire-and-forget here. The backend's worker
+        // consumes a kick and drops it whenever the vring is not yet marked
+        // enabled (vhost-user-backend event_loop.rs: read_kick(), then
+        // `if !enabled { return }`), and resume_vm() artificially kicks the
+        // devices right after activate() returns — a backend still chewing
+        // through SET_MEM_TABLE/SET_VRING_* eats the restore's first kicks
+        // FOREVER: the guest's request sits in the ring unprocessed
+        // (reproduced under backend-freeze jitter as a restored guest
+        // stalled pre-fs, the Gate 12 warmup-9-class flake). Re-querying
+        // the protocol features is a reply-bearing request on this ordered
+        // socket with no side effects on either end: waiting for the reply
+        // proves the backend processed the enables. (GET_VRING_BASE would
+        // also force a reply but stops the ring per spec.)
+        self.vu_handle
+            .get_protocol_features()
+            .map_err(|err| {
+                self.metrics.activate_fails.inc();
+                ActivateError::VhostUser(err)
+            })?;
+        // === AGENTVFS LOCAL CHANGE END ===
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         let delta_us = get_time_us(ClockType::Monotonic) - start_time;
         self.metrics.activate_time_us.store(delta_us);
@@ -930,6 +953,9 @@ mod tests {
         }
 
         fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures, vhost::Error> {
+            // === AGENTVFS LOCAL CHANGE BEGIN: record the fence query (Gate 12) ===
+            record_vu_event("get_protocol_features".to_string());
+            // === AGENTVFS LOCAL CHANGE END ===
             Ok(self.protocol_features)
         }
 
@@ -1200,6 +1226,34 @@ mod tests {
         assert_eq!(restored.id, "test_fs");
         assert_eq!(restored.num_request_queues, 1);
     }
+
+    // === AGENTVFS LOCAL CHANGE BEGIN: fence regression test (Gate 12) ===
+    #[test]
+    fn test_activate_fences_vring_enable_before_resume() {
+        // The restore-time kick race (Gate 12 warmup-9-class flake): the
+        // backend drops any kick its worker consumes before SET_VRING_ENABLE
+        // is processed. activate() must therefore close the enable window
+        // with a reply-forcing round trip AFTER the last SET_VRING_ENABLE —
+        // pinned here against the mock's event log.
+        let mut device = snapshot_master_device(VhostUserProtocolFeatures::DEVICE_STATE, 1);
+        clear_vu_events();
+        activate_device(&mut device);
+        let events = vu_events();
+        let last_enable = events
+            .iter()
+            .rposition(|event| event.starts_with("set_vring_enable"))
+            .unwrap_or_else(|| panic!("no set_vring_enable in {events:?}"));
+        let fence = events
+            .iter()
+            .rposition(|event| event == "get_protocol_features")
+            .unwrap_or_else(|| panic!("missing fence get_protocol_features in {events:?}"));
+        assert!(
+            fence > last_enable,
+            "the enable fence must follow the last set_vring_enable: {events:?}"
+        );
+        assert_eq!(fence, events.len() - 1, "the fence closes activate(): {events:?}");
+    }
+    // === AGENTVFS LOCAL CHANGE END ===
 
     #[test]
     fn test_restore_without_device_state_fails() {
