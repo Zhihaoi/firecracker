@@ -203,7 +203,10 @@ impl VhostUserFrontendReqHandlerMut for VhostUserFsReqHandler {
             libc::PROT_READ
         };
         let req_fd_offset = req.fd_offset;
-        info!(
+        // Per-request chatter: debug! only — info! writes to stdout, which
+        // IS the guest serial console in the harness (a map line landing
+        // mid-ATVERB corrupts the verb protocol and strands the guest).
+        debug!(
             "vhost-user-fs DAX map: window_host_addr={:#x} offset={:#x} len={:#x} fd={} fd_offset={:#x}",
             self.window_host_addr as u64, offset, len, fd.as_raw_fd(), req_fd_offset
         );
