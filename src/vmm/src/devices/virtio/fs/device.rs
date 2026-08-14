@@ -1,18 +1,26 @@
 // Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ffi::c_void;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Deref;
-use std::sync::Arc;
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use utils::time::{ClockType, get_time_us};
 use vhost::vhost_user::Frontend;
 use vhost::vhost_user::message::*;
+use vhost::vhost_user::{
+    FrontendReqHandler, HandlerResult, VhostUserFrontendReqHandlerMut,
+};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{NUM_HIPRIO_QUEUES, QUEUE_SIZE, TAG_LEN, VhostUserFsError};
 use crate::devices::virtio::ActivateError;
-use crate::devices::virtio::device::{ActiveState, DeviceState, VirtioDevice, VirtioDeviceType};
+use crate::devices::virtio::device::{
+    ActiveState, DeviceState, ShmemRegion, VirtioDevice, VirtioDeviceType,
+};
 use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
@@ -23,10 +31,12 @@ use crate::devices::virtio::vhost_user::{
 use crate::devices::virtio::vhost_user_metrics::{
     VhostUserDeviceMetrics, VhostUserMetricsPerDevice,
 };
-use crate::logger::{IncMetric, StoreMetric, log_dev_preview_warning};
-use crate::utils::u64_to_usize;
+use crate::logger::{IncMetric, StoreMetric, error, info, log_dev_preview_warning};
+use crate::utils::{mib_to_bytes, u64_to_usize};
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::resources::AllocPolicy;
+use crate::vstate::vm::KvmVm;
 use crate::{MutEventSubscriber, impl_device_type};
 
 /// Fs device config space size in bytes: the mount tag (`TAG_LEN` bytes)
@@ -47,7 +57,7 @@ const DEFAULT_NUM_REQUEST_QUEUES: u16 = 1;
 /// backend device-state transfer that snapshotting relies on; if the
 /// backend does not advertise it the device works normally, but snapshots
 /// are refused at save time.
-const REQUESTED_PROTOCOL_FEATURES: VhostUserProtocolFeatures =
+const BASE_REQUESTED_PROTOCOL_FEATURES: VhostUserProtocolFeatures =
     VhostUserProtocolFeatures::DEVICE_STATE;
 
 /// Builds the fs device config space from the mount tag and the number of
@@ -76,6 +86,8 @@ pub struct VhostUserFsConfig {
     pub tag: String,
     /// Number of request queues, in addition to the hiprio queue.
     pub num_request_queues: u16,
+    /// Size of the DAX cache window in MiB. If unset, DAX is disabled.
+    pub dax_window_size_mib: Option<u64>,
 }
 
 impl From<&FsDeviceConfig> for VhostUserFsConfig {
@@ -87,11 +99,161 @@ impl From<&FsDeviceConfig> for VhostUserFsConfig {
             num_request_queues: value
                 .num_request_queues
                 .unwrap_or(DEFAULT_NUM_REQUEST_QUEUES),
+            dax_window_size_mib: value.dax_window_size_mib,
         }
     }
 }
 
 pub type VhostUserFs = VhostUserFsImpl<Frontend>;
+
+/// virtio-fs shared-memory capability id for the DAX cache window.
+const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
+
+/// A 2 MiB-aligned DAX cache window backed by a memfd and mapped into
+/// both host virtual address space and guest physical address space.
+#[derive(Debug)]
+pub struct DaxWindow {
+    /// memfd backing the window.
+    #[expect(dead_code)]
+    memfd: memfd::Memfd,
+    /// Host virtual address of the start of the window.
+    host_addr: *mut c_void,
+    /// Guest physical address of the start of the window.
+    gpa: u64,
+    /// Size of the window in bytes.
+    size: u64,
+    /// KVM slot used to map the GPA range.
+    kvm_slot: u32,
+}
+
+// SAFETY: `DaxWindow` owns the mapped region and the raw pointer is not
+// exposed for concurrent mutation.
+unsafe impl Send for DaxWindow {}
+// SAFETY: `DaxWindow` owns the mapped region and the raw pointer is not
+// exposed for concurrent mutation.
+unsafe impl Sync for DaxWindow {}
+
+impl Drop for DaxWindow {
+    fn drop(&mut self) {
+        // SAFETY: the mapping was created with this exact address and size.
+        unsafe {
+            libc::munmap(self.host_addr, u64_to_usize(self.size));
+        }
+    }
+}
+
+/// Handler for vhost-user backend requests related to the DAX window.
+#[derive(Debug)]
+pub struct VhostUserFsReqHandler {
+    window_host_addr: *mut c_void,
+    window_size: u64,
+}
+
+// SAFETY: the raw pointer is to a host VA reservation owned by the
+// associated `DaxWindow`, which outlives the handler thread.
+unsafe impl Send for VhostUserFsReqHandler {}
+// SAFETY: the raw pointer is to a host VA reservation owned by the
+// associated `DaxWindow`, which outlives the handler thread.
+unsafe impl Sync for VhostUserFsReqHandler {}
+
+impl VhostUserFsReqHandler {
+    fn validate_mmap_request(&self, req: &VhostUserMMap) -> Result<(u64, u64), std::io::Error> {
+        const PAGE: u64 = 4096;
+        if req.shmid != VIRTIO_FS_SHMCAP_ID_CACHE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsupported shmem id",
+            ));
+        }
+        // Page granularity is the real constraint (mmap); the 2 MiB FUSE
+        // mapping unit is the guest's own allocation granularity and does
+        // not constrain the host-side map. The backend's tail clamps and
+        // blob-cache offsets are page-aligned, not 2 MiB-aligned.
+        if !req.shm_offset.is_multiple_of(PAGE)
+            || !req.len.is_multiple_of(PAGE)
+            || !req.fd_offset.is_multiple_of(PAGE)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DAX window mapping must be page aligned",
+            ));
+        }
+        let end = req
+            .shm_offset
+            .checked_add(req.len)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "overflow"))?;
+        if end > self.window_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DAX window mapping out of bounds",
+            ));
+        }
+        Ok((req.shm_offset, req.len))
+    }
+}
+
+impl VhostUserFrontendReqHandlerMut for VhostUserFsReqHandler {
+    fn shmem_map(&mut self, req: &VhostUserMMap, fd: &dyn AsRawFd) -> HandlerResult<u64> {
+        let (offset, len) = self.validate_mmap_request(req)?;
+        // Read-only mappings map read-only: a MAP_SHARED|PROT_WRITE mmap of
+        // the backend's read-only blobcache fd would fail EACCES.
+        let prot = if req.flags & VhostUserMMapFlags::WRITABLE.bits() != 0 {
+            libc::PROT_READ | libc::PROT_WRITE
+        } else {
+            libc::PROT_READ
+        };
+        let req_fd_offset = req.fd_offset;
+        info!(
+            "vhost-user-fs DAX map: window_host_addr={:#x} offset={:#x} len={:#x} fd={} fd_offset={:#x}",
+            self.window_host_addr as u64, offset, len, fd.as_raw_fd(), req_fd_offset
+        );
+        // SAFETY: the validated range falls within the reserved host VA
+        // reservation and is page aligned.
+        let addr = unsafe {
+            libc::mmap(
+                self.window_host_addr
+                    .cast::<u8>()
+                    .add(u64_to_usize(offset))
+                    .cast::<c_void>(),
+                u64_to_usize(len),
+                prot,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd.as_raw_fd(),
+                libc::off_t::try_from(req.fd_offset).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "fd offset overflow")
+                })?,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(0)
+    }
+
+    fn shmem_unmap(&mut self, req: &VhostUserMMap) -> HandlerResult<u64> {
+        let (offset, len) = self.validate_mmap_request(req)?;
+        // SAFETY: the validated range falls within the reserved host VA
+        // reservation. Replacing it with a PROT_NONE anonymous mapping keeps
+        // the VA reservation intact.
+        let addr = unsafe {
+            libc::mmap(
+                self.window_host_addr
+                    .cast::<u8>()
+                    .add(u64_to_usize(offset))
+                    .cast::<c_void>(),
+                u64_to_usize(len),
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(0)
+    }
+}
 
 /// vhost-user fs device.
 pub struct VhostUserFsImpl<T: VhostUserHandleBackend> {
@@ -120,6 +282,15 @@ pub struct VhostUserFsImpl<T: VhostUserHandleBackend> {
     /// are set up and enabled.
     pub backend_state: Option<Vec<u8>>,
     pub metrics: Arc<VhostUserDeviceMetrics>,
+
+    // DAX window state.
+    pub(crate) dax_window_size_mib: Option<u64>,
+    dax_window: Option<DaxWindow>,
+    shmem_region: Option<ShmemRegion>,
+    /// Thread serving backend requests for the DAX window.
+    backend_req_thread: Option<JoinHandle<()>>,
+    /// Eventfd used to stop the backend request thread.
+    backend_req_stop: Option<EventFd>,
 }
 
 // Need custom implementation because otherwise `Debug` is required for `vhost::Master`
@@ -143,6 +314,9 @@ impl<T: VhostUserHandleBackend> std::fmt::Debug for VhostUserFsImpl<T> {
             )
             .field("backend_state", &self.backend_state.as_ref().map(Vec::len))
             .field("metrics", &self.metrics)
+            .field("dax_window_size_mib", &self.dax_window_size_mib)
+            .field("dax_window", &self.dax_window)
+            .field("shmem_region", &self.shmem_region)
             .finish()
     }
 }
@@ -155,8 +329,20 @@ impl<T: VhostUserHandleBackend> VhostUserFsImpl<T> {
         // The config space (including the mount tag) is a frontend property,
         // so no CONFIG protocol feature is requested. DEVICE_STATE is
         // requested so the backend can transfer its internal state for
-        // snapshotting.
-        let requested_protocol_features = REQUESTED_PROTOCOL_FEATURES;
+        // snapshotting. If a DAX window is configured, the backend must
+        // support BACKEND_REQ and SHMEM so it can map file pages into the
+        // window.
+        let dax_enabled = config.dax_window_size_mib.is_some();
+        let mut requested_protocol_features = BASE_REQUESTED_PROTOCOL_FEATURES;
+        if dax_enabled {
+            // REPLY_ACK is load-bearing, not optional: it makes the backend's
+            // SHMEM_MAP wait for our mmap to complete before it answers the
+            // guest's SETUPMAPPING — otherwise the guest can read the window
+            // before the mapping lands (nondeterministic stale reads).
+            requested_protocol_features |= VhostUserProtocolFeatures::BACKEND_REQ
+                | VhostUserProtocolFeatures::SHMEM
+                | VhostUserProtocolFeatures::REPLY_ACK;
+        }
 
         let num_queues = NUM_HIPRIO_QUEUES + u64::from(config.num_request_queues);
         let mut vu_handle = VhostUserHandleImpl::<T>::new(&config.socket, num_queues)
@@ -204,6 +390,12 @@ impl<T: VhostUserHandleBackend> VhostUserFsImpl<T> {
             vu_acked_protocol_features: acked_protocol_features,
             backend_state: None,
             metrics,
+
+            dax_window_size_mib: config.dax_window_size_mib,
+            dax_window: None,
+            shmem_region: None,
+            backend_req_thread: None,
+            backend_req_stop: None,
         })
     }
 
@@ -213,6 +405,250 @@ impl<T: VhostUserHandleBackend> VhostUserFsImpl<T> {
             socket: self.vu_handle.socket_path.clone(),
             tag: Some(self.tag.clone()),
             num_request_queues: Some(self.num_request_queues),
+            dax_window_size_mib: self.dax_window_size_mib,
+        }
+    }
+
+    /// Create and register the DAX cache window. Must be called before the
+    /// device is attached to the MMIO transport, so the shared-memory region
+    /// can be exposed via the virtio 1.2 SHM registers. On snapshot restore,
+    /// `at_gpa` carries the persisted GPA: the window is re-registered there
+    /// exactly (the guest's mapping table names it) without re-allocating —
+    /// the restored allocator already holds the range.
+    pub fn create_dax_window(
+        &mut self,
+        vm: &KvmVm,
+        at_gpa: Option<u64>,
+    ) -> Result<(), VhostUserFsError> {
+        let Some(size_mib) = self.dax_window_size_mib else {
+            return Ok(());
+        };
+        if self.dax_window.is_some() {
+            return Ok(());
+        }
+
+        let size = mib_to_bytes(u64_to_usize(size_mib)) as u64;
+        let memfd = Self::create_memfd(size)?;
+        let (host_addr, _host_size) = Self::map_window_host(size, memfd.as_file().as_raw_fd())?;
+
+        let gpa = match at_gpa {
+            // Restore path: the snapshot serializes the resource allocator
+            // WITH this range already allocated (the boot path below took it
+            // from past_mmio64_memory), so re-reserving it collides. Follow
+            // the MMIO-device idiom instead: persisted resources are
+            // re-registered, not re-allocated. Trust the persisted GPA.
+            Some(gpa) => gpa,
+            None => {
+                let gpa_range = vm
+                    .resource_allocator()
+                    .past_mmio64_memory
+                    .allocate(size, size, AllocPolicy::FirstMatch)
+                    .map_err(VhostUserFsError::ResourceAllocator)?;
+                gpa_range.start()
+            }
+        };
+
+        let kvm_slot = vm
+            .register_device_memory_region(gpa, host_addr as u64, size)
+            .map_err(VhostUserFsError::Vm)?;
+
+        self.dax_window = Some(DaxWindow {
+            memfd,
+            host_addr,
+            gpa,
+            size,
+            kvm_slot,
+        });
+        self.shmem_region = Some(ShmemRegion {
+            id: VIRTIO_FS_SHMCAP_ID_CACHE,
+            len: size,
+            gpa,
+        });
+        Ok(())
+    }
+
+    fn create_memfd(size: u64) -> Result<memfd::Memfd, VhostUserFsError> {
+        let memfd = memfd::MemfdOptions::default()
+            .create("vhost_user_fs_dax")
+            .map_err(VhostUserFsError::Memfd)?;
+        memfd
+            .as_file()
+            .set_len(size)
+            .map_err(VhostUserFsError::MemfdSetLen)?;
+        Ok(memfd)
+    }
+
+    /// Allocate a 2 MiB-aligned host VA range and map the memfd into it.
+    fn map_window_host(size: u64, fd: libc::c_int) -> Result<(*mut c_void, usize), VhostUserFsError> {
+        let align = mib_to_bytes(2);
+        let size_usize = u64_to_usize(size);
+        // Over-allocate by one alignment unit so that trimming head/tail
+        // leaves a 2 MiB-aligned region of the requested size, regardless of
+        // the host page size.
+        let alloc_size = size_usize + align;
+        // Reserve a large enough range that trimming head/tail leaves a
+        // 2 MiB-aligned region of the requested size.
+        // SAFETY: mmap with anonymous, non-backed mapping is safe when
+        // requested size is non-zero and we check the returned pointer.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                alloc_size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(VhostUserFsError::Mmap(std::io::Error::last_os_error()));
+        }
+        let aligned_ptr = ((ptr as usize + align - 1) & !(align - 1)) as *mut c_void;
+        let head_size = aligned_ptr as usize - ptr as usize;
+        let tail_size = alloc_size - head_size - size_usize;
+
+        if head_size > 0 {
+            // SAFETY: head is within the allocation we just created.
+            unsafe {
+                libc::munmap(ptr, head_size);
+            }
+        }
+        if tail_size > 0 {
+            // SAFETY: tail starts at the end of the desired region.
+            unsafe {
+                libc::munmap(
+                    (aligned_ptr as usize + size_usize) as *mut c_void,
+                    tail_size,
+                );
+            }
+        }
+
+        // Map the memfd into the aligned reservation.
+        // SAFETY: aligned_ptr is a 2 MiB-aligned reservation of `size` bytes
+        // that we own exclusively.
+        let mapped = unsafe {
+            libc::mmap(
+                aligned_ptr,
+                size_usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            // Best-effort cleanup of the reservation before returning the error.
+            // SAFETY: aligned_ptr is a valid reservation of `size` bytes.
+            unsafe {
+                libc::munmap(aligned_ptr, size_usize);
+            }
+            return Err(VhostUserFsError::Mmap(std::io::Error::last_os_error()));
+        }
+        assert_eq!(mapped, aligned_ptr);
+        Ok((aligned_ptr, size_usize))
+    }
+
+    /// Guest physical address where the DAX window starts, if configured.
+    pub fn dax_window_gpa(&self) -> Option<u64> {
+        self.dax_window.as_ref().map(|w| w.gpa)
+    }
+
+    fn start_backend_req_handler(&mut self) -> Result<(), VhostUserFsError> {
+        let window = self.dax_window.as_ref().ok_or_else(|| {
+            VhostUserFsError::BackendReq(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "DAX window not created",
+            ))
+        })?;
+
+        let handler = Arc::new(Mutex::new(VhostUserFsReqHandler {
+            window_host_addr: window.host_addr,
+            window_size: window.size,
+        }));
+        let mut frontend_handler =
+            FrontendReqHandler::new(handler).map_err(VhostUserFsError::BackendReqVhost)?;
+        // Answer NEED_REPLY requests when REPLY_ACK was negotiated: the
+        // backend uses it so SHMEM_MAP waits for this mmap to complete —
+        // the fence behind the restore-time re-map.
+        frontend_handler.set_reply_ack_flag(
+            self.vu_acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits() != 0,
+        );
+
+        // Spawn the handler thread BEFORE handing the TX end to the
+        // backend. set_backend_request_fd waits for the backend's ack, and
+        // the backend's set_backend_req_fd handler synchronously re-maps
+        // DAX ranges (SHMEM_MAP → waits for OUR reply) before it can ack:
+        // spawn-after-send is a circular wait (gate13 v34 restore hang).
+        // Requests can't arrive before the fd is sent, so polling early is
+        // harmless.
+        let stop = EventFd::new(libc::EFD_NONBLOCK).map_err(VhostUserFsError::EventFd)?;
+        let stop_fd = stop.as_raw_fd();
+        let handler_fd = frontend_handler.as_raw_fd();
+        // AsRawFd on FrontendReqHandler yields the receiving (sub_sock) end,
+        // which is what OUR handler thread polls — handing that to the
+        // backend would strand every backend request unread on the other
+        // socket half.
+        let tx_fd = frontend_handler.get_tx_raw_fd();
+        self.backend_req_stop = Some(stop);
+        self.backend_req_thread = Some(std::thread::spawn(move || {
+            Self::backend_req_thread(frontend_handler, handler_fd, stop_fd);
+        }));
+
+        self.vu_handle
+            .vu
+            .set_backend_request_fd(&tx_fd)
+            .map_err(VhostUserFsError::Vhost)?;
+        Ok(())
+    }
+
+    fn backend_req_thread(
+        mut handler: FrontendReqHandler<Mutex<VhostUserFsReqHandler>>,
+        handler_fd: libc::c_int,
+        stop_fd: libc::c_int,
+    ) {
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: handler_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: fds is a valid array of two pollfd entries.
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if ret < 0 {
+                break;
+            }
+            if fds[1].revents != 0 {
+                break;
+            }
+            if fds[0].revents & libc::POLLIN != 0 {
+                // A failed request (bad mmap params, decode error) must not
+                // kill the channel — only a broken socket is fatal.
+                match handler.handle_request() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("vhost-user-fs DAX backend request failed: {e}");
+                        if e.should_reconnect() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn stop_backend_req_handler(&mut self) {
+        if let Some(stop) = self.backend_req_stop.take() {
+            let _ = stop.write(1);
+        }
+        if let Some(thread) = self.backend_req_thread.take() {
+            let _ = thread.join();
         }
     }
 
@@ -322,6 +758,12 @@ impl<T: VhostUserHandleBackend> VhostUserFsImpl<T> {
     }
 }
 
+impl<T: VhostUserHandleBackend> Drop for VhostUserFsImpl<T> {
+    fn drop(&mut self) {
+        self.stop_backend_req_handler();
+    }
+}
+
 impl<T: VhostUserHandleBackend + Send + 'static> VirtioDevice for VhostUserFsImpl<T>
 where
     VhostUserFsImpl<T>: MutEventSubscriber,
@@ -407,6 +849,16 @@ where
             })?;
         }
 
+        // If a DAX window is configured, the backend needs the
+        // backend-request channel so it can send SHMEM_MAP/SHMEM_UNMAP
+        // requests before the guest issues FUSE_SETUPMAPPING.
+        if self.dax_window.is_some() {
+            self.start_backend_req_handler().map_err(|err| {
+                self.metrics.activate_fails.inc();
+                ActivateError::VhostUserFs(err)
+            })?;
+        }
+
         // All queues - the hiprio queue at index 0 and the request
         // queues after it - are handed over to the backend. The
         // frontend never parses FUSE frames, it only ferries vring
@@ -464,12 +916,17 @@ where
     fn _reset(&mut self) -> bool {
         false
     }
+
+    fn shmem_regions(&self) -> &[ShmemRegion] {
+        self.shmem_region.as_slice()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
+    use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixStream;
 
     use event_manager::{EventOps, Events, MutEventSubscriber};
@@ -494,6 +951,7 @@ mod tests {
             socket: "sock".to_string(),
             tag: None,
             num_request_queues: None,
+            dax_window_size_mib: None,
         };
         let config = VhostUserFsConfig::from(&fs_config);
         assert_eq!(config.fs_id, "test_fs");
@@ -507,6 +965,7 @@ mod tests {
             socket: "sock".to_string(),
             tag: Some("my_tag".to_string()),
             num_request_queues: Some(4),
+            dax_window_size_mib: None,
         };
         let config = VhostUserFsConfig::from(&fs_config);
         assert_eq!(config.tag, "my_tag");
@@ -597,6 +1056,7 @@ mod tests {
             socket: tmp_socket_path.clone(),
             tag: "test_fs".to_string(),
             num_request_queues: 1,
+            dax_window_size_mib: None,
         };
         let vhost_fs = VhostUserFsImpl::<MockMaster>::new(vhost_fs_config).unwrap();
 
@@ -690,6 +1150,7 @@ mod tests {
             socket: tmp_socket_path,
             tag: "my_tag".to_string(),
             num_request_queues: 3,
+            dax_window_size_mib: None,
         };
         let mut vhost_fs = VhostUserFsImpl::<MockMaster>::new(vhost_fs_config).unwrap();
 
@@ -754,6 +1215,7 @@ mod tests {
             socket: tmp_socket_path,
             tag: "t".repeat(2 * TAG_LEN),
             num_request_queues: 1,
+            dax_window_size_mib: None,
         };
         let vhost_fs = VhostUserFsImpl::<MockMaster>::new(vhost_fs_config).unwrap();
         assert_eq!(vhost_fs.tag.len(), 2 * TAG_LEN);
@@ -874,6 +1336,7 @@ mod tests {
             socket: tmp_socket_path,
             tag: "test_fs".to_string(),
             num_request_queues: 2,
+            dax_window_size_mib: None,
         };
         let mut vhost_fs = VhostUserFsImpl::<MockMaster>::new(vhost_fs_config).unwrap();
         assert_eq!(vhost_fs.queues().len(), 3);
@@ -1063,6 +1526,7 @@ mod tests {
             socket: tmp_socket_path,
             tag: "test_fs".to_string(),
             num_request_queues,
+            dax_window_size_mib: None,
         };
         VhostUserFsImpl::<MockSnapshotMaster>::new(vhost_fs_config).unwrap()
     }
@@ -1174,6 +1638,7 @@ mod tests {
             socket: tmp_socket_path,
             tag: "test_fs".to_string(),
             num_request_queues: 1,
+            dax_window_size_mib: None,
         })
         .unwrap();
         activate_device(&mut device);
@@ -1191,6 +1656,7 @@ mod tests {
         let mut restored = VhostUserFsImpl::<MockSnapshotMaster>::restore(
             FsConstructorArgs {
                 mem: guest_memory.clone(),
+                vm: None,
             },
             &state,
         )
@@ -1273,6 +1739,7 @@ mod tests {
             socket: tmp_socket_path,
             tag: "test_fs".to_string(),
             num_request_queues: 1,
+            dax_window_size_mib: None,
         })
         .unwrap();
         let mut state: VhostUserFsState = device.save();
@@ -1291,6 +1758,7 @@ mod tests {
         let result = VhostUserFsImpl::<MockSnapshotMaster>::restore(
             FsConstructorArgs {
                 mem: guest_memory.clone(),
+                vm: None,
             },
             &state,
         );
@@ -1303,10 +1771,188 @@ mod tests {
         // backend (nothing to load).
         state.backend_state = Vec::new();
         let restored = VhostUserFsImpl::<MockSnapshotMaster>::restore(
-            FsConstructorArgs { mem: guest_memory },
+            FsConstructorArgs {
+                mem: guest_memory,
+                vm: None,
+            },
             &state,
         )
         .unwrap();
         assert!(restored.backend_state.is_none());
+    }
+
+    const TWO_MIB: u64 = 2 * 1024 * 1024;
+
+    struct TestWindow {
+        ptr: *mut c_void,
+        size: usize,
+    }
+
+    impl TestWindow {
+        fn new(size: usize) -> Self {
+            // SAFETY: anonymous mmap with a non-zero size; we check the result.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(ptr, libc::MAP_FAILED);
+            Self { ptr, size }
+        }
+
+        fn handler(&self) -> VhostUserFsReqHandler {
+            VhostUserFsReqHandler {
+                window_host_addr: self.ptr,
+                window_size: self.size as u64,
+            }
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            // SAFETY: the mapping was created with this exact address and size.
+            unsafe {
+                libc::munmap(self.ptr, self.size);
+            }
+        }
+    }
+
+    struct BadFd;
+    impl AsRawFd for BadFd {
+        fn as_raw_fd(&self) -> i32 {
+            -1
+        }
+    }
+
+    fn mmap_req(shmid: u8, shm_offset: u64, len: u64) -> VhostUserMMap {
+        VhostUserMMap {
+            shmid,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset,
+            len,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn test_shmem_map_wrong_shmid() {
+        let window = TestWindow::new(u64_to_usize(4 * TWO_MIB));
+        let mut handler = window.handler();
+        let req = mmap_req(1, 0, TWO_MIB);
+        assert!(handler.shmem_map(&req, &BadFd).is_err());
+    }
+
+    #[test]
+    fn test_shmem_map_misaligned() {
+        let window = TestWindow::new(u64_to_usize(4 * TWO_MIB));
+        let mut handler = window.handler();
+        // shm_offset not 2 MiB aligned.
+        let req = mmap_req(0, TWO_MIB + 1, TWO_MIB);
+        assert!(handler.shmem_map(&req, &BadFd).is_err());
+        // len not 2 MiB aligned.
+        let req = mmap_req(0, 0, TWO_MIB + 1);
+        assert!(handler.shmem_map(&req, &BadFd).is_err());
+    }
+
+    #[test]
+    fn test_shmem_map_out_of_bounds() {
+        let window = TestWindow::new(u64_to_usize(4 * TWO_MIB));
+        let mut handler = window.handler();
+        let req = mmap_req(0, 2 * TWO_MIB, 4 * TWO_MIB);
+        assert!(handler.shmem_map(&req, &BadFd).is_err());
+    }
+
+    #[test]
+    fn test_shmem_map_unmap_happy_path() {
+        let window = TestWindow::new(u64_to_usize(4 * TWO_MIB));
+        let mut handler = window.handler();
+        let memfd = memfd::MemfdOptions::default()
+            .create("test_dax")
+            .unwrap();
+        memfd.as_file().set_len(TWO_MIB).unwrap();
+
+        let req = mmap_req(0, 0, TWO_MIB);
+        assert_eq!(handler.shmem_map(&req, memfd.as_file()).unwrap(), 0);
+        assert_eq!(handler.shmem_unmap(&req).unwrap(), 0);
+    }
+
+    /// Wire-level probe: feed the exact byte layout the vendored nydusd
+    /// (vhost 0.15 + agentvfs patch) puts on the backend-req channel and
+    /// verify handle_request parses it and the file content lands in the
+    /// window.
+    #[test]
+    fn test_shmem_map_wire_compat() {
+        let mut f = TempFile::new().unwrap().into_file();
+        let pattern: Vec<u8> = (0..TWO_MIB as usize).map(|i| (i % 251) as u8).collect();
+        f.write_all(&pattern).unwrap();
+        f.flush().unwrap();
+
+        let window = TestWindow::new(u64_to_usize(4 * TWO_MIB));
+        let handler = std::sync::Arc::new(Mutex::new(window.handler()));
+        let mut frontend = FrontendReqHandler::new(handler).unwrap();
+
+        // Header {code=9 (SHMEM_MAP), flags=1 (version 1), size=40} then the
+        // 40-byte VhostUserMMap {shmid 0, fd_offset 0, shm_offset 0,
+        // len 2 MiB, flags 2 (FUSE READ)}, fd via SCM_RIGHTS.
+        let mut hdr = [0u8; 12];
+        hdr[0..4].copy_from_slice(&9u32.to_ne_bytes());
+        hdr[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        hdr[8..12].copy_from_slice(&40u32.to_ne_bytes());
+        let mut body = [0u8; 40];
+        body[24..32].copy_from_slice(&TWO_MIB.to_ne_bytes());
+        // flags = 0: the wire carries vhost-user VhostUserMMapFlags (WRITABLE
+        // is the only defined bit); a read mapping is all zeros.
+
+        let iov = [
+            libc::iovec {
+                iov_base: hdr.as_ptr() as *mut c_void,
+                iov_len: hdr.len(),
+            },
+            libc::iovec {
+                iov_base: body.as_ptr() as *mut c_void,
+                iov_len: body.len(),
+            },
+        ];
+        let mut cmsg_space = [0u8; 64];
+        // SAFETY: all pointers valid and the cmsg buffer is large enough for
+        // one fd.
+        let sent = unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+            msg.msg_iovlen = iov.len();
+            msg.msg_control = cmsg_space.as_mut_ptr() as *mut c_void;
+            msg.msg_controllen = cmsg_space.len();
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(4) as usize;
+            std::ptr::write(libc::CMSG_DATA(cmsg) as *mut i32, f.as_raw_fd());
+            msg.msg_controllen = libc::CMSG_SPACE(4) as usize;
+            libc::sendmsg(frontend.get_tx_raw_fd(), &msg, 0)
+        };
+        assert_eq!(sent, 52);
+
+        // Stage-by-stage bisect of handle_request's validation.
+        use vhost::vhost_user::message::VhostUserMsgValidator;
+        let mmap = VhostUserMMap {
+            shmid: 0,
+            padding: [0; 7],
+            fd_offset: 0,
+            shm_offset: 0,
+            len: TWO_MIB,
+            flags: 0,
+        };
+        assert!(mmap.is_valid(), "mmap body invalid");
+
+        frontend.handle_request().expect("handle_request");
+        // SAFETY: the window is 4 MiB reserved; the first 2 MiB were mapped.
+        let win = unsafe { std::slice::from_raw_parts(window.ptr as *const u8, TWO_MIB as usize) };
+        assert_eq!(win, &pattern[..], "window must carry the file content");
     }
 }

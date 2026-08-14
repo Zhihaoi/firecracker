@@ -116,6 +116,8 @@ pub enum StartMicrovmError {
     SetVmResources(MachineConfigError),
     /// Cannot create the entropy device: {0}
     CreateEntropyDevice(crate::devices::virtio::rng::EntropyError),
+    /// Cannot create the fs device DAX window: {0}
+    CreateFsDevice(crate::devices::virtio::fs::VhostUserFsError),
     /// Failed to allocate guest resource: {0}
     AllocateResources(#[from] vm_allocator::Error),
     /// Error starting GDB debug session: {0}
@@ -700,8 +702,13 @@ fn attach_fs_devices<'a, I: Iterator<Item = &'a Arc<Mutex<VhostUserFs>>> + Debug
     fs_devices: I,
     event_manager: &mut EventManager,
 ) -> Result<(), StartMicrovmError> {
+    let Vm::Kvm(kvm_vm) = vm;
     for fs in fs_devices {
         let id = fs.lock().expect("Poisoned lock").id().to_string();
+        fs.lock()
+            .expect("Poisoned lock")
+            .create_dax_window(kvm_vm, None)
+            .map_err(StartMicrovmError::CreateFsDevice)?;
         // The device mutex mustn't be locked here otherwise it will deadlock.
         device_manager.attach_boot_virtio_device(
             vm,

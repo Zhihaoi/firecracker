@@ -95,6 +95,7 @@ mod tests {
             socket: "dummy".to_string(),
             tag: None,
             num_request_queues: None,
+            dax_window_size_mib: None,
         };
         assert_eq!(
             vmm_action_from_request(parse_put_fs(&Body::new(body), Some("foo")).unwrap()),

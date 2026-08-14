@@ -12,7 +12,7 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{VirtioInterrupt, VirtioInterruptType};
-use crate::devices::virtio::device::VirtioDevice;
+use crate::devices::virtio::device::{ShmemRegion, VirtioDevice};
 use crate::devices::virtio::device_status;
 use crate::devices::virtio::queue::Queue;
 use crate::logger::{IncMetric, METRICS, error, warn};
@@ -62,6 +62,9 @@ pub struct MmioTransport {
     mem: GuestMemoryMmap,
     pub(crate) interrupt: Arc<IrqTrigger>,
     pub is_vhost_user: bool,
+    // Virtio 1.2 shared-memory regions exposed by the device.
+    shmem_regions: Vec<ShmemRegion>,
+    shmem_select: u32,
 }
 
 impl MmioTransport {
@@ -72,6 +75,7 @@ impl MmioTransport {
         device: Arc<Mutex<dyn VirtioDevice>>,
         is_vhost_user: bool,
     ) -> MmioTransport {
+        let shmem_regions = device.lock().expect("Poisoned lock").shmem_regions().to_vec();
         MmioTransport {
             device,
             features_select: 0,
@@ -82,6 +86,8 @@ impl MmioTransport {
             mem,
             interrupt,
             is_vhost_user,
+            shmem_regions,
+            shmem_select: 0,
         }
     }
 
@@ -112,6 +118,10 @@ impl MmioTransport {
             Some(queue) => f(queue),
             None => d,
         }
+    }
+
+    fn selected_shmem_region(&self) -> Option<&ShmemRegion> {
+        self.shmem_regions.get(self.shmem_select as usize)
     }
 
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&mut self, f: F) -> bool {
@@ -269,14 +279,33 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x70 => self.device_status,
-                    // Virtio 1.2 shared-memory region length registers
-                    // (VIRTIO_MMIO_SHM_LEN_LOW/HIGH). No Firecracker device
-                    // exposes shared memory regions, so report the selected
-                    // region's length as all-ones: the value the spec defines
-                    // for a nonexistent region. Guest drivers that enumerate
-                    // these during probe (e.g. virtio-fs looking for its DAX
-                    // cache window) treat any other length as a real region.
-                    0xb0 | 0xb4 => !0,
+                    // Virtio 1.2 shared-memory region registers
+                    // (VIRTIO_MMIO_SHM_LEN_LOW/HIGH and
+                    // VIRTIO_MMIO_SHM_BASE_LOW/HIGH). If the device exposes no
+                    // region at the selected index, report all-ones as the spec
+                    // requires for a nonexistent region.
+                    0xb0 | 0xb4 => {
+                        let shift = if offset == 0xb0 { 0 } else { 32 };
+                        self.selected_shmem_region().map_or(!0, |r| {
+                            // The shift is either 0 or 32, so the result is
+                            // guaranteed to fit in a u32.
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                (r.len >> shift) as u32
+                            }
+                        })
+                    }
+                    0xb8 | 0xbc => {
+                        let shift = if offset == 0xb8 { 0 } else { 32 };
+                        self.selected_shmem_region().map_or(!0, |r| {
+                            // The shift is either 0 or 32, so the result is
+                            // guaranteed to fit in a u32.
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                (r.gpa >> shift) as u32
+                            }
+                        })
+                    }
                     0xfc => self.config_generation,
                     _ => {
                         warn!("unknown virtio mmio register read: {:#x}", offset);
@@ -342,11 +371,9 @@ impl BusDevice for MmioTransport {
                     0xa0 => self.update_queue_field(|q| lo(&mut q.used_ring_address, v)),
                     0xa4 => self.update_queue_field(|q| hi(&mut q.used_ring_address, v)),
                     // Virtio 1.2 shared-memory region selector
-                    // (VIRTIO_MMIO_SHM_SEL). Firecracker devices expose no
-                    // shared memory regions, so the selection is irrelevant;
-                    // accept and ignore the write. Reads of the region length
-                    // registers above report every region as nonexistent.
-                    0xac => {}
+                    // (VIRTIO_MMIO_SHM_SEL). Selects the region reported by the
+                    // SHM_LEN_* and SHM_BASE_* registers.
+                    0xac => self.shmem_select = v,
                     _ => {
                         warn!("unknown virtio mmio register write: {:#x}", offset);
                     }
@@ -510,6 +537,7 @@ pub(crate) mod tests {
         config_bytes: [u8; 0xeff],
         activate_should_error: bool,
         reset_should_fail: bool,
+        shmem_regions: Vec<ShmemRegion>,
     }
 
     impl DummyDevice {
@@ -527,11 +555,16 @@ pub(crate) mod tests {
                 config_bytes: [0; 0xeff],
                 activate_should_error: false,
                 reset_should_fail: false,
+                shmem_regions: Vec::new(),
             }
         }
 
         pub fn set_avail_features(&mut self, avail_features: u64) {
             self.avail_features = avail_features;
+        }
+
+        pub fn set_shmem_regions(&mut self, regions: Vec<ShmemRegion>) {
+            self.shmem_regions = regions;
         }
     }
 
@@ -569,6 +602,10 @@ pub(crate) mod tests {
 
         fn queue_events(&self) -> &[EventFd] {
             &self.queue_evts
+        }
+
+        fn shmem_regions(&self) -> &[ShmemRegion] {
+            &self.shmem_regions
         }
 
         fn interrupt_trigger(&self) -> &dyn VirtioInterrupt {
@@ -1301,5 +1338,78 @@ pub(crate) mod tests {
         irq_trigger
             .trigger(VirtioInterruptType::Queue(0))
             .unwrap_err();
+    }
+
+    #[test]
+    fn test_shm_registers_no_region() {
+        let m = single_region_mem(0x1000);
+        let interrupt = Arc::new(IrqTrigger::new());
+        let mut d = MmioTransport::new(
+            m,
+            interrupt,
+            Arc::new(Mutex::new(DummyDevice::new())),
+            false,
+        );
+
+        let mut buf = [0; 4];
+
+        // With no shared-memory regions exposed, all SHM registers read as !0.
+        d.read(0x0, 0xb0, &mut buf);
+        assert_eq!(read_le_u32(&buf), !0);
+        d.read(0x0, 0xb4, &mut buf);
+        assert_eq!(read_le_u32(&buf), !0);
+        d.read(0x0, 0xb8, &mut buf);
+        assert_eq!(read_le_u32(&buf), !0);
+        d.read(0x0, 0xbc, &mut buf);
+        assert_eq!(read_le_u32(&buf), !0);
+    }
+
+    #[test]
+    fn test_shm_registers_with_region() {
+        let m = single_region_mem(0x1000);
+        let interrupt = Arc::new(IrqTrigger::new());
+        let mut dummy = DummyDevice::new();
+        dummy.set_shmem_regions(vec![ShmemRegion {
+            id: 0,
+            len: 0x0001_0000_0002_0003,
+            gpa: 0x0004_0005_0006_0007,
+        }]);
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(dummy)), false);
+
+        let mut buf = [0; 4];
+
+        d.read(0x0, 0xb0, &mut buf);
+        assert_eq!(read_le_u32(&buf), 0x0002_0003);
+        d.read(0x0, 0xb4, &mut buf);
+        assert_eq!(read_le_u32(&buf), 0x0001_0000);
+        d.read(0x0, 0xb8, &mut buf);
+        assert_eq!(read_le_u32(&buf), 0x0006_0007);
+        d.read(0x0, 0xbc, &mut buf);
+        assert_eq!(read_le_u32(&buf), 0x0004_0005);
+    }
+
+    #[test]
+    fn test_shm_registers_out_of_range() {
+        let m = single_region_mem(0x1000);
+        let interrupt = Arc::new(IrqTrigger::new());
+        let mut dummy = DummyDevice::new();
+        dummy.set_shmem_regions(vec![ShmemRegion {
+            id: 0,
+            len: 0x1000,
+            gpa: 0x4000,
+        }]);
+        let mut d = MmioTransport::new(m, interrupt, Arc::new(Mutex::new(dummy)), false);
+
+        let mut buf = [0; 4];
+
+        // Select a region index that does not exist.
+        write_le_u32(&mut buf, 1);
+        d.write(0x0, 0xac, &buf);
+        assert_eq!(d.shmem_select, 1);
+
+        d.read(0x0, 0xb0, &mut buf);
+        assert_eq!(read_le_u32(&buf), !0);
+        d.read(0x0, 0xb8, &mut buf);
+        assert_eq!(read_le_u32(&buf), !0);
     }
 }

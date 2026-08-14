@@ -75,6 +75,18 @@ pub enum VirtioDeviceType {
 /// Unique identifier for a virtio device: its type and string ID.
 pub type VirtioDeviceId = (VirtioDeviceType, String);
 
+/// A shared-memory region exposed by a virtio device through the MMIO
+/// transport's SHM_SEL/SHM_LEN/SHM_BASE registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmemRegion {
+    /// Region index selected by the driver via SHM_SEL.
+    pub id: u8,
+    /// Length of the region in bytes.
+    pub len: u64,
+    /// Guest physical address where the region is mapped.
+    pub gpa: u64,
+}
+
 /// Trait for virtio devices to be driven by a virtio transport.
 ///
 /// The lifecycle of a virtio device is to be moved to a virtio transport, which will then query the
@@ -254,6 +266,11 @@ pub trait VirtioDevice: AsAny + MutEventSubscriber + Send {
         if self.is_activated() {
             self.notify_queue_events();
         }
+    }
+
+    /// Shared-memory regions exposed by this device via the MMIO transport.
+    fn shmem_regions(&self) -> &[ShmemRegion] {
+        &[]
     }
 
     /// Prepare the device for saving its state

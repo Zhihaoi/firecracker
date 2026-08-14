@@ -14,6 +14,7 @@ use crate::devices::virtio::vhost_user::VhostUserHandleBackend;
 use crate::snapshot::Persist;
 use crate::utils::u64_to_usize;
 use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::vm::KvmVm;
 
 /// vhost-user fs device state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,21 +30,28 @@ pub struct VhostUserFsState {
     /// fds, so the blob rides inside the device state. Empty when the
     /// device was not activated at snapshot time.
     pub backend_state: Vec<u8>,
+    /// Size of the DAX cache window in MiB, if configured.
+    #[serde(default)]
+    pub dax_window_size_mib: Option<u64>,
+    /// Guest physical address where the DAX window is mapped.
+    #[serde(default)]
+    pub dax_window_gpa: Option<u64>,
 }
 
 /// Auxiliary structure for creating a device when resuming from a snapshot.
 #[derive(Debug)]
-pub struct FsConstructorArgs {
+pub struct FsConstructorArgs<'a> {
     pub mem: GuestMemoryMmap,
+    pub vm: Option<&'a KvmVm>,
 }
 
-impl<T> Persist<'_> for VhostUserFsImpl<T>
+impl<'a, T> Persist<'a> for VhostUserFsImpl<T>
 where
     T: VhostUserHandleBackend + Send + 'static,
     VhostUserFsImpl<T>: MutEventSubscriber,
 {
     type State = VhostUserFsState;
-    type ConstructorArgs = FsConstructorArgs;
+    type ConstructorArgs = FsConstructorArgs<'a>;
     type Error = VhostUserFsError;
 
     /// Embed the backend state blob captured by `capture_backend_state`
@@ -58,6 +66,8 @@ where
             vu_acked_protocol_features: self.vu_acked_protocol_features,
             virtio_state: VirtioDeviceState::from_device(self),
             backend_state: self.backend_state.clone().unwrap_or_default(),
+            dax_window_size_mib: self.dax_window_size_mib,
+            dax_window_gpa: self.dax_window_gpa(),
         }
     }
 
@@ -80,7 +90,19 @@ where
             socket: state.socket_path.clone(),
             tag: state.tag.clone(),
             num_request_queues: state.num_request_queues,
+            dax_window_size_mib: state.dax_window_size_mib,
         })?;
+
+        // Re-create the DAX window before the device is attached to the
+        // MMIO transport, pinned to the persisted GPA (the restored guest's
+        // mapping table names it).
+        if state.dax_window_size_mib.is_some() {
+            let vm = constructor_args.vm.ok_or(VhostUserFsError::DaxWindowGpaMismatch)?;
+            device.create_dax_window(vm, state.dax_window_gpa)?;
+            if device.dax_window_gpa() != state.dax_window_gpa {
+                return Err(VhostUserFsError::DaxWindowGpaMismatch);
+            }
+        }
 
         // Sanity: the freshly negotiated virtio features must cover what
         // the guest had acked, and if there is backend state to load, the
@@ -127,6 +149,8 @@ mod tests {
                 activated: true,
             },
             backend_state: b"backend-state-blob".to_vec(),
+            dax_window_size_mib: None,
+            dax_window_gpa: None,
         };
 
         let serialized = bitcode::serialize(&state).unwrap();

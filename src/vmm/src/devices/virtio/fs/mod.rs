@@ -32,6 +32,21 @@ pub enum VhostUserFsError {
     DeviceStateTransfer(std::io::Error),
     /// Error creating memfd for the backend device state transfer: {0}
     Memfd(#[from] memfd::Error),
+    /// Error resizing memfd: {0}
+    MemfdSetLen(std::io::Error),
+    /// Error creating/mapping the DAX window: {0}
+    Mmap(std::io::Error),
+    /// Error allocating guest resources for the DAX window: {0}
+    ResourceAllocator(vm_allocator::Error),
+    /// Error registering the DAX window with KVM: {0}
+    Vm(crate::vstate::vm::VmError),
+    /// Error setting up the backend request channel: {0}
+    BackendReq(std::io::Error),
+    /// Error setting up the backend request channel: {0}
+    BackendReqVhost(vhost::vhost_user::Error),
+    /// Invalid DAX window state in snapshot: persisted GPA differs from
+    /// restored allocation
+    DaxWindowGpaMismatch,
     /// Invalid virtio state in snapshot: {0}
     VirtioState(#[from] crate::devices::virtio::persist::PersistError),
     /// Vhost-user error: {0}

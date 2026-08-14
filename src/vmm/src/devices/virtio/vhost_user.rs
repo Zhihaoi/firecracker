@@ -166,6 +166,12 @@ pub trait VhostUserHandleBackend: Sized {
         unimplemented!()
     }
 
+    /// Set the file descriptor used for backend-to-frontend requests.
+    /// Requires the BACKEND_REQ protocol feature to be negotiated.
+    fn set_backend_request_fd(&mut self, _fd: &dyn AsRawFd) -> Result<(), vhost::Error> {
+        unimplemented!()
+    }
+
     /// Begin transfer of internal state from/to the backend for the purpose
     /// of migration/snapshotting. Requires the DEVICE_STATE protocol feature
     /// to be negotiated.
@@ -282,6 +288,10 @@ impl VhostUserHandleBackend for Frontend {
         buf: &[u8],
     ) -> Result<(), vhost::Error> {
         <Frontend as VhostUserFrontend>::set_config(self, offset, flags, buf)
+    }
+
+    fn set_backend_request_fd(&mut self, fd: &dyn AsRawFd) -> Result<(), vhost::Error> {
+        <Frontend as VhostUserFrontend>::set_backend_request_fd(self, fd)
     }
 
     fn set_device_state_fd(

@@ -636,7 +636,10 @@ impl<'a> Persist<'a> for MMIOVirtioDevices {
 
         for fs_state in &state.fs_devices {
             let device = Arc::new(Mutex::new(VhostUserFs::restore(
-                FsConstructorArgs { mem: mem.clone() },
+                FsConstructorArgs {
+                    mem: mem.clone(),
+                    vm: Some(vm),
+                },
                 &fs_state.device_state,
             )?));
 

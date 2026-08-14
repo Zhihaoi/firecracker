@@ -447,6 +447,42 @@ impl KvmVm {
         Ok(())
     }
 
+    /// Register a standalone guest physical memory range that is not part of
+    /// [`GuestMemoryMmap`]. Used for virtio-fs DAX windows and similar
+    /// device-owned shared memory. Returns the allocated KVM slot id.
+    pub fn register_device_memory_region(
+        &self,
+        guest_addr: u64,
+        host_addr: u64,
+        size: u64,
+    ) -> Result<u32, VmError> {
+        let slot = self
+            .next_kvm_slot(1)
+            .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
+        let region = kvm_userspace_memory_region {
+            flags: 0,
+            slot,
+            guest_phys_addr: guest_addr,
+            memory_size: size,
+            userspace_addr: host_addr,
+        };
+        self.set_user_memory_region(region)?;
+        Ok(slot)
+    }
+
+    /// Unregister a device memory range previously registered with
+    /// [`Self::register_device_memory_region`].
+    pub fn unregister_device_memory_region(&self, slot: u32) -> Result<(), VmError> {
+        let region = kvm_userspace_memory_region {
+            flags: 0,
+            slot,
+            guest_phys_addr: 0,
+            memory_size: 0,
+            userspace_addr: 0,
+        };
+        self.set_user_memory_region(region)
+    }
+
     /// Register a list of new memory regions to this [`KvmVm`].
     pub fn register_dram_memory_regions(
         &mut self,
