@@ -31,7 +31,7 @@ use crate::devices::virtio::vhost_user::{
 use crate::devices::virtio::vhost_user_metrics::{
     VhostUserDeviceMetrics, VhostUserMetricsPerDevice,
 };
-use crate::logger::{IncMetric, StoreMetric, error, info, log_dev_preview_warning};
+use crate::logger::{IncMetric, StoreMetric, debug, error, info, log_dev_preview_warning};
 use crate::utils::{mib_to_bytes, u64_to_usize};
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
