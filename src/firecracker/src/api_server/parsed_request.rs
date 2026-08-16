@@ -86,9 +86,16 @@ impl TryFrom<&Request> for ParsedRequest {
             (Method::Get, "", None) => parse_get_instance_info(),
             (Method::Get, "balloon", None) => parse_get_balloon(path_tokens),
             (Method::Get, "version", None) => parse_get_version(),
-            (Method::Get, "vm", None) if path_tokens.next() == Some("config") => {
-                Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig))
-            }
+            (Method::Get, "vm", None) => match path_tokens.next() {
+                Some("config") => Ok(ParsedRequest::new_sync(VmmAction::GetFullVmConfig)),
+                Some("dax-window-dirty") => {
+                    Ok(ParsedRequest::new_sync(VmmAction::GetDaxWindowDirty))
+                }
+                _ => Err(RequestError::InvalidPathMethod(
+                    "vm".to_string(),
+                    Method::Get,
+                )),
+            },
             (Method::Get, "machine-config", None) => parse_get_machine_config(),
             (Method::Get, "mmds", None) => parse_get_mmds(),
             (Method::Get, "hotplug", None) if path_tokens.next() == Some("memory") => {
@@ -204,6 +211,7 @@ impl ParsedRequest {
                     Self::success_response_with_data(balloon_config)
                 }
                 VmmData::BalloonStats(stats) => Self::success_response_with_data(stats),
+                VmmData::DaxWindowDirty(info) => Self::success_response_with_data(info),
                 VmmData::VirtioMemStatus(data) => Self::success_response_with_data(data),
                 VmmData::HintingStatus(hinting_status) => {
                     Self::success_response_with_data(hinting_status)
@@ -608,6 +616,9 @@ pub mod tests {
                 VmmData::BalloonStats(stats) => {
                     http_response(&serde_json::to_string(stats).unwrap(), 200)
                 }
+                VmmData::DaxWindowDirty(info) => {
+                    http_response(&serde_json::to_string(info).unwrap(), 200)
+                }
                 VmmData::VirtioMemStatus(data) => {
                     http_response(&serde_json::to_string(data).unwrap(), 200)
                 }
@@ -746,6 +757,22 @@ pub mod tests {
         connection.try_read().unwrap();
         let req = connection.pop_parsed_request().unwrap();
         ParsedRequest::try_from(&req).unwrap();
+    }
+
+    #[test]
+    fn test_try_from_get_vm_dax_window_dirty() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut connection = HttpConnection::new(receiver);
+        sender
+            .write_all(http_request("GET", "/vm/dax-window-dirty", None).as_bytes())
+            .unwrap();
+        connection.try_read().unwrap();
+        let req = connection.pop_parsed_request().unwrap();
+        let parsed_request = ParsedRequest::try_from(&req).unwrap();
+        assert_eq!(
+            vmm_action_from_request(parsed_request),
+            VmmAction::GetDaxWindowDirty
+        );
     }
 
     #[test]

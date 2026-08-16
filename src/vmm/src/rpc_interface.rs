@@ -31,7 +31,7 @@ use crate::vmm_config::balloon::{
 use crate::vmm_config::boot_source::{BootSourceConfig, BootSourceConfigError};
 use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, DriveError};
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
-use crate::vmm_config::fs::{FsConfigError, FsDeviceConfig};
+use crate::vmm_config::fs::{DaxWindowDirtyInfo, FsConfigError, FsDeviceConfig};
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
 use crate::vmm_config::memory_hotplug::{
@@ -70,6 +70,9 @@ pub enum VmmAction {
     GetBalloonConfig,
     /// Get the ballon device latest statistics.
     GetBalloonStats,
+    /// Get the dirty-page bitmap of the virtio-fs DAX window. This action can only be called
+    /// after the microVM has booted.
+    GetDaxWindowDirty,
     /// Get complete microVM configuration in JSON format.
     GetFullVmConfig,
     /// Get MMDS contents.
@@ -235,6 +238,8 @@ pub enum VmmData {
     BalloonConfig(BalloonDeviceConfig),
     /// The latest balloon device statistics.
     BalloonStats(BalloonStats),
+    /// The dirty-page bitmap of the virtio-fs DAX window.
+    DaxWindowDirty(DaxWindowDirtyInfo),
     /// No data is sent on the channel.
     Empty,
     /// The complete microVM configuration in JSON format.
@@ -512,6 +517,7 @@ impl<'a> PrebootApiController<'a> {
             | Pause
             | Resume
             | GetBalloonStats
+            | GetDaxWindowDirty
             | GetMemoryHotplugStatus
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
@@ -732,6 +738,13 @@ impl RuntimeApiController {
                 .expect("Poisoned lock")
                 .latest_balloon_stats()
                 .map(VmmData::BalloonStats)
+                .map_err(VmmActionError::InternalVmm),
+            GetDaxWindowDirty => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .dax_window_dirty_log()
+                .map(VmmData::DaxWindowDirty)
                 .map_err(VmmActionError::InternalVmm),
             GetFullVmConfig => Ok(VmmData::FullVmConfig(
                 self.vmm.lock().expect("Poisoned lock").full_config(),

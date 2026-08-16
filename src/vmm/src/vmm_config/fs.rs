@@ -34,6 +34,25 @@ pub struct FsDeviceConfig {
     pub dax_window_size_mib: Option<u64>,
 }
 
+/// Dirty-page tracking information of a virtio-fs DAX window, as returned
+/// by `GET /vm/dax-window-dirty`. The bitmap is a snapshot taken with
+/// `KVM_GET_DIRTY_LOG`, which is fetch-and-clear: each call returns only
+/// the pages dirtied since the previous call, and tracking continues
+/// automatically afterwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaxWindowDirtyInfo {
+    /// Guest physical address of the start of the DAX window.
+    pub gpa: u64,
+    /// Size of the DAX window in bytes.
+    pub size: u64,
+    /// Page size in bytes used by the dirty bitmap.
+    pub page_size: usize,
+    /// Lowercase hex encoding of the dirty bitmap bytes (little-endian
+    /// u64 words, bit `i` of the bitmap is page `i`, counted from the
+    /// start of the window).
+    pub bitmap_hex: String,
+}
+
 /// Wrapper for the collection that holds all the Fs Devices.
 #[derive(Debug, Default)]
 pub struct FsBuilder {

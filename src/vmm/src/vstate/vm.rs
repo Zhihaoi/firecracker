@@ -15,8 +15,8 @@ use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_IRQCHIP_IOAPIC;
 use kvm_bindings::{
-    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MSI_VALID_DEVID, KvmIrqRouting,
-    kvm_irq_routing_entry, kvm_userspace_memory_region,
+    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_MEM_LOG_DIRTY_PAGES, KVM_MSI_VALID_DEVID,
+    KvmIrqRouting, kvm_irq_routing_entry, kvm_userspace_memory_region,
 };
 use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
@@ -449,18 +449,27 @@ impl KvmVm {
 
     /// Register a standalone guest physical memory range that is not part of
     /// [`GuestMemoryMmap`]. Used for virtio-fs DAX windows and similar
-    /// device-owned shared memory. Returns the allocated KVM slot id.
+    /// device-owned shared memory. When `log_dirty` is true, the slot is
+    /// registered with `KVM_MEM_LOG_DIRTY_PAGES`, so the pages the guest
+    /// writes can later be fetched with `KVM_GET_DIRTY_LOG`. Returns the
+    /// allocated KVM slot id.
     pub fn register_device_memory_region(
         &self,
         guest_addr: u64,
         host_addr: u64,
         size: u64,
+        log_dirty: bool,
     ) -> Result<u32, VmError> {
         let slot = self
             .next_kvm_slot(1)
             .ok_or(VmError::NotEnoughMemorySlots(self.common.max_memslots))?;
+        let flags = if log_dirty {
+            KVM_MEM_LOG_DIRTY_PAGES
+        } else {
+            0
+        };
         let region = kvm_userspace_memory_region {
-            flags: 0,
+            flags,
             slot,
             guest_phys_addr: guest_addr,
             memory_size: size,

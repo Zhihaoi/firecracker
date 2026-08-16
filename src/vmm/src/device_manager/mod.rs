@@ -115,6 +115,8 @@ pub enum AttachDeviceError {
 pub enum FindDeviceError {
     /// Device not found
     DeviceNotFound,
+    /// Multiple matching devices found
+    MultipleDevices,
 }
 
 #[derive(Debug, Default)]
@@ -451,6 +453,27 @@ impl DeviceManager {
             VirtioDevices::Pci(pci_devices) => {
                 pci_devices.for_each_virtio_device_mut(&mut f);
             }
+        }
+    }
+
+    /// Returns the DAX window dirty-log identity (KVM slot id, size in
+    /// bytes, guest physical address) of the single virtio-fs device that
+    /// has a DAX window. Fails if there is no such device, or if there is
+    /// more than one.
+    pub fn dax_window_dirty_log_info(&self) -> Result<(u32, u64, u64), FindDeviceError> {
+        let mut found: Vec<(u32, u64, u64)> = Vec::new();
+        self.for_each_virtio_device(|device_type, device| {
+            if VirtioDeviceType::Fs == device_type
+                && let Some(fs) = device.as_any().downcast_ref::<VhostUserFs>()
+                && let Some(info) = fs.dax_window_dirty_log_info()
+            {
+                found.push(info);
+            }
+        });
+        match found.len() {
+            1 => Ok(found[0]),
+            0 => Err(FindDeviceError::DeviceNotFound),
+            _ => Err(FindDeviceError::MultipleDevices),
         }
     }
 

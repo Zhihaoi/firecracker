@@ -130,6 +130,7 @@ use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::terminal::Terminal;
 use vstate::vcpu::{self, VcpuSendEventError};
 
+use crate::arch::host_page_size;
 use crate::cpu_config::templates::CpuConfiguration;
 use crate::devices::virtio::balloon::device::{HintingStatus, StartHintingCmd};
 use crate::devices::virtio::balloon::{
@@ -151,10 +152,12 @@ use crate::persist::{MicrovmState, MicrovmStateError, VmInfo};
 use crate::rate_limiter::BucketUpdate;
 use crate::resources::VmmConfig;
 use crate::rpc_interface::VmmActionError;
+use crate::utils::u64_to_usize;
 use crate::vmm_config::HotplugDeviceConfig;
 use crate::vmm_config::balloon::BalloonDeviceConfig;
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::entropy::EntropyDeviceConfig;
+use crate::vmm_config::fs::DaxWindowDirtyInfo;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfig;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
@@ -689,6 +692,34 @@ impl Vmm {
             })
             .map_err(VmmError::FindDeviceError)??;
         Ok(())
+    }
+
+    /// Fetches and clears the KVM dirty-page bitmap of the virtio-fs DAX
+    /// window. See [`DaxWindowDirtyInfo`] for the fetch-and-clear
+    /// semantics of the returned bitmap.
+    pub fn dax_window_dirty_log(&self) -> Result<DaxWindowDirtyInfo, VmmError> {
+        let (kvm_slot, size, gpa) = self.device_manager.dax_window_dirty_log_info()?;
+        let bitmap = self
+            .vm
+            .as_kvm()
+            .ok_or(VmmError::NotSupported)?
+            .fd()
+            .get_dirty_log(kvm_slot, u64_to_usize(size))
+            .map_err(VmmError::DirtyBitmap)?;
+
+        let mut bitmap_hex = String::with_capacity(bitmap.len() * 16);
+        for word in &bitmap {
+            for byte in word.to_le_bytes() {
+                bitmap_hex.push_str(&format!("{byte:02x}"));
+            }
+        }
+
+        Ok(DaxWindowDirtyInfo {
+            gpa,
+            size,
+            page_size: host_page_size(),
+            bitmap_hex,
+        })
     }
 
     /// Starts the balloon free page hinting run

@@ -452,7 +452,7 @@ impl<T: VhostUserHandleBackend> VhostUserFsImpl<T> {
         };
 
         let kvm_slot = vm
-            .register_device_memory_region(gpa, host_addr as u64, size)
+            .register_device_memory_region(gpa, host_addr as u64, size, true)
             .map_err(VhostUserFsError::Vm)?;
 
         self.dax_window = Some(DaxWindow {
@@ -554,6 +554,16 @@ impl<T: VhostUserHandleBackend> VhostUserFsImpl<T> {
     /// Guest physical address where the DAX window starts, if configured.
     pub fn dax_window_gpa(&self) -> Option<u64> {
         self.dax_window.as_ref().map(|w| w.gpa)
+    }
+
+    /// KVM slot id, size (in bytes) and guest physical address of the DAX
+    /// window, if created. The slot is registered with KVM dirty-page
+    /// tracking enabled, so its bitmap can be fetched with
+    /// `KVM_GET_DIRTY_LOG`.
+    pub fn dax_window_dirty_log_info(&self) -> Option<(u32, u64, u64)> {
+        self.dax_window
+            .as_ref()
+            .map(|w| (w.kvm_slot, w.size, w.gpa))
     }
 
     fn start_backend_req_handler(&mut self) -> Result<(), VhostUserFsError> {
