@@ -43,8 +43,14 @@ pub struct CreateSnapshotParams {
     pub snapshot_type: SnapshotType,
     /// Path to the file that will contain the microVM state.
     pub snapshot_path: PathBuf,
-    /// Path to the file that will contain the guest memory.
-    pub mem_file_path: PathBuf,
+    /// Path to the file that will contain the guest memory. When absent,
+    /// the snapshot is STATE-ONLY: no guest memory is dumped at all (the
+    /// memory image is taken by an external reader off the live memfd —
+    /// the agentvfs live-split flow). `snapshot_type`'s memory
+    /// implication is meaningless in that case (kept for API
+    /// compatibility); loading such a snapshot still needs a memory
+    /// backend from somewhere (File or Uffd), supplied by the loader.
+    pub mem_file_path: Option<PathBuf>,
 }
 
 /// Allows for changing the mapping between tap devices and host devices

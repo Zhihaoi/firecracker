@@ -184,7 +184,17 @@ pub fn create_snapshot(
             "snapshot requires KVM".into(),
         ))
     })?;
-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
+    // State-only snapshot: no mem_file_path means no memory dump at all —
+    // the vmstate file is the whole snapshot, memory being read by an
+    // external consumer off the live guest_mem memfd instead (agentvfs
+    // live split). The dirty state is left unconsumed: with
+    // track_dirty_pages=false (the mincore Diff regime) there is no
+    // bitmap to reset — reset_dirty is a no-op — and with tracking on,
+    // bits accumulate into the next memory-bearing Diff (a superset, so
+    // content-correct). mark_virtio_queue_memory_dirty below still runs.
+    if let Some(mem_file_path) = &params.mem_file_path {
+        kvm_vm.snapshot_memory_to_file(mem_file_path, params.snapshot_type)?;
+    }
 
     // We need to mark queues as dirty again for all activated devices. The reason we
     // do it here is that we don't mark pages as dirty during runtime
